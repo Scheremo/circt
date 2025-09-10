@@ -39,11 +39,17 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/LineIterator.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 using namespace circt;
@@ -226,6 +232,13 @@ struct CLOptions {
       cl::desc("One or more top-level modules to instantiate (instead of "
                "figuring it out automatically)"),
       cl::value_desc("name"), cl::cat(cat)};
+
+  cl::opt<std::string> fileListPath{
+      "file-list",
+      cl::desc(
+          "Read additional input files from a text file (one path per line) "
+          "-D defines and -I include paths are supported."),
+      cl::value_desc("path"), cl::cat(cat)};
 
   cl::list<std::string> paramOverrides{
       "G",
@@ -504,9 +517,97 @@ static LogicalResult executeWithSources(MLIRContext *context,
   return success();
 }
 
+static LogicalResult readFileList(StringRef listPath,
+                                  SmallVectorImpl<std::string> &outIncludeDirs,
+                                  SmallVectorImpl<std::string> &outDefines,
+                                  SmallVectorImpl<std::string> &outInputs) {
+
+  auto bufOrErr = llvm::MemoryBuffer::getFile(listPath);
+  if (!bufOrErr) {
+    llvm::errs() << "error: failed to open file list: " << listPath << "\n";
+    return failure();
+  }
+
+  // Resolve relatives against the list file’s directory.
+  SmallString<256> baseDir = llvm::sys::path::parent_path(listPath);
+
+  for (llvm::line_iterator it(**bufOrErr, /*SkipBlanks=*/false), e; it != e;
+       ++it) {
+    StringRef line = *it;
+    line = line.trim();
+    if (line.empty() || line.starts_with("#"))
+      continue;
+
+    // -Ifoo  or  -I foo
+    {
+      StringRef tmp = line;
+      if (tmp.consume_front("-I")) {
+        tmp = tmp.ltrim();
+        if (tmp.empty()) {
+          llvm::errs() << "error: -I requires a path (in " << listPath << ")\n";
+          return failure();
+        }
+        SmallString<256> incPath;
+        if (llvm::sys::path::is_absolute(tmp)) {
+          incPath = tmp;
+        } else {
+          incPath = baseDir;
+          llvm::sys::path::append(incPath, tmp);
+        }
+        llvm::sys::path::remove_dots(incPath, /*remove_dot_dot=*/true);
+        outIncludeDirs.push_back(std::string(incPath));
+        continue;
+      }
+    }
+
+    // -DNAME  /  -D NAME  /  -DNAME=VALUE
+    {
+      StringRef tmp = line;
+      if (tmp.consume_front("-D")) {
+        tmp = tmp.ltrim();
+        if (tmp.empty()) {
+          llvm::errs() << "error: -D requires NAME or NAME=VALUE (in "
+                       << listPath << ")\n";
+          return failure();
+        }
+        outDefines.push_back(tmp.str());
+        continue;
+      }
+    }
+
+    // Otherwise: treat as input filename
+    SmallString<256> absPath;
+    if (llvm::sys::path::is_absolute(line)) {
+      absPath = line;
+    } else {
+      absPath = baseDir;
+      llvm::sys::path::append(absPath, line);
+    }
+    llvm::sys::path::remove_dots(absPath, /*remove_dot_dot=*/true);
+    outInputs.push_back(std::string(absPath));
+  }
+
+  return success();
+}
+
 static LogicalResult execute(MLIRContext *context) {
-  // Default to reading from stdin if no files were provided except if
-  // commandfiles were.
+
+  SmallVector<std::string, 16> listI, listD, listInputs;
+
+  if (!opts.fileListPath.empty()) {
+    if (failed(readFileList(opts.fileListPath, listI, listD, listInputs)))
+      return failure();
+  }
+
+  // Start from the CLI values (copy out of cl::list)
+  for (const auto &s : listI)
+    opts.includeDirs.push_back(s);
+  for (const auto &s : listD)
+    opts.defines.push_back(s);
+  for (const auto &s : listInputs)
+    opts.inputFilenames.push_back(s);
+
+  // Default to reading from stdin if no files were provided.
   if (opts.inputFilenames.empty() && opts.commandFiles.empty()) {
     opts.inputFilenames.push_back("-");
   }
