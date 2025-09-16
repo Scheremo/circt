@@ -1742,6 +1742,30 @@ class Builtin<string mnemonic, list<Trait> traits = []> :
     MooreOp<"builtin." # mnemonic, traits>;
 
 //===----------------------------------------------------------------------===//
+// Time Format Builtins
+//===----------------------------------------------------------------------===//
+
+def TimeformatBIOp : Builtin<"timeformat",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Set %t output format (units, precision, suffix, width)";
+  let description = [{ Mirrors SystemVerilog $timeformat. }];
+
+  // All four are immediates in SV → model them as attributes.
+  let arguments = (ins
+    I8Attr:$units_number,                       // e.g. -9 for ns
+    I8Attr:$precision_number,                   // >= 0
+    OptionalAttr<StrAttr>:$suffix_string,       // optional suffix
+    OptionalAttr<I8Attr>:$minimum_field_width   // optional width
+  );
+
+  let assemblyFormat =
+    "$units_number `,` $precision_number"
+    " (`,` $suffix_string^)?"
+    " (`,` $minimum_field_width^)?"
+    " attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
 // Pseudo-Random Generators
 //===----------------------------------------------------------------------===//
 

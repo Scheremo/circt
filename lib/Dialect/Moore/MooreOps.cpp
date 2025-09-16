@@ -25,6 +25,42 @@ using namespace circt::moore;
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
+// Time format resource and helper functions, kept per scope
+//===----------------------------------------------------------------------===//
+
+struct TimeFormatResource
+    : public mlir::SideEffects::Resource::Base<TimeFormatResource> {
+  TimeFormatResource() = default;
+  static mlir::TypeID getResourceID() { return mlir::TypeID::get<TimeFormatResource>(); }
+  llvm::StringRef getName() override { return "moore.timeformat"; }
+};
+
+static llvm::StringRef getScopeKey(mlir::Operation *op) {
+  // Use a Time format scope per module; time formats of different modules may be independent
+  if (auto inst = op->getParentOfType<moore::InstanceOp>())
+    return inst.getModuleName();
+  return "__module__";
+}
+
+static mlir::SideEffects::Resource *getTimeFmtResFor(mlir::Operation *op) {
+  static llvm::StringMap<std::unique_ptr<TimeFormatResource>> cache;
+  auto key = getScopeKey(op);
+  auto it  = cache.find(key);
+  if (it == cache.end())
+    it = cache.try_emplace(key, std::make_unique<TimeFormatResource>()).first;
+  return it->second.get();
+}
+
+//===----------------------------------------------------------------------===//
+// Time format resource accessors
+//===----------------------------------------------------------------------===//
+
+void TimeformatBIOp::getEffects(
+    llvm::SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), getTimeFmtResFor(getOperation()));
+}
+
+//===----------------------------------------------------------------------===//
 // SVModuleOp
 //===----------------------------------------------------------------------===//
 

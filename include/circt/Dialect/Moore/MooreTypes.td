@@ -483,6 +483,13 @@ def FourValuedI64 : MooreType<CPred<[{
   let builderCall = "IntType::getLogic($_builder.getContext(), 64)";
 }
 
+// A 8-bit two-valued integer.
+def TwoValuedI8 : MooreType<CPred<[{
+    moore::isIntType($_self, 8, moore::Domain::TwoValued)
+  }]>, "8-bit two-valued integer type", "moore::IntType"> {
+  let builderCall = "IntType::getInt($_builder.getContext(), 8)";
+}
+
 // A 32-bit two-valued integer.
 def TwoValuedI32 : MooreType<CPred<[{
     moore::isIntType($_self, 32, moore::Domain::TwoValued)
