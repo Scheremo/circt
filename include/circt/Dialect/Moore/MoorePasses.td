@@ -39,4 +39,10 @@ def LowerConcatRef : Pass<"moore-lower-concatref", "moore::SVModuleOp"> {
     let constructor = "circt::moore::createLowerConcatRefPass()";
 }
 
+def AnnotateTimeformatPass
+    : Pass<"moore-annotate-timeformat", "moore::SVModuleOp"> {
+  let summary = "Annotate Ops with their current time format";
+  let constructor = "circt::moore::createAnnotateTimeformatPass()";
+}
+
 #endif // CIRCT_DIALECT_MOORE_MOOREPASSES_TD
