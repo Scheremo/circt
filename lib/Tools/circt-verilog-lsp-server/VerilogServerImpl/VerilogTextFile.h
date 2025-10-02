@@ -70,6 +70,7 @@ private:
 
   /// The full string contents of the file.
   std::string contents;
+  std::shared_mutex contentMutex;
 
   /// The project-scale driver
   std::shared_ptr<slang::driver::Driver> projectDriver;
@@ -80,7 +81,8 @@ private:
 
   /// The chunks of this file. The order of these chunks is the order in which
   /// they appear in the text file.
-  std::unique_ptr<circt::lsp::VerilogDocument> document;
+  std::shared_ptr<circt::lsp::VerilogDocument> document;
+  std::shared_mutex docMutex;
 };
 
 } // namespace lsp
