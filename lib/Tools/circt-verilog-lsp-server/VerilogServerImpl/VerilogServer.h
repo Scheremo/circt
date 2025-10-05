@@ -6,14 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Main entry function for circt-verilog-lsp-server for when built as standalone
-// binary.
+// VerilogServer.h
+//
+// This header declares VerilogServer, the top-level coordinator of the CIRCT
+// Verilog LSP server. It manages all open files and acts as the entry point for
+// language server operations such as “didOpen”, “didChange”, “didClose”,
+// “definition”, and “references”.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVER_H_
-#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVER_H_
-
+#pragma once
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LSP/Protocol.h"
 
@@ -78,5 +80,3 @@ private:
 
 } // namespace lsp
 } // namespace circt
-
-#endif // LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVER_H_
