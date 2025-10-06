@@ -20,7 +20,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#pragma once
+#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGTEXTFILE_H_
+#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGTEXTFILE_H_
+
 #include "llvm/Support/LSP/Protocol.h"
 
 #include "VerilogDocument.h"
@@ -70,6 +72,8 @@ private:
   /// The version of this file.
   int64_t version = 0;
 
+
+
   /// The chunks of this file. The order of these chunks is the order in which
   /// they appear in the text file.
   std::unique_ptr<circt::lsp::VerilogDocument> document;
@@ -77,3 +81,5 @@ private:
 
 } // namespace lsp
 } // namespace circt
+
+#endif

@@ -16,7 +16,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#pragma once
+#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGDOCUMENT_H_
+#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGDOCUMENT_H_
+
 #include "slang/ast/Compilation.h"
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
@@ -100,3 +102,5 @@ private:
 
 } // namespace lsp
 } // namespace circt
+
+#endif

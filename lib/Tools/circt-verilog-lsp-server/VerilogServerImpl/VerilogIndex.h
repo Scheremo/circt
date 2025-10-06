@@ -8,6 +8,9 @@
 // VerilogIndex
 //===----------------------------------------------------------------------===//
 
+#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGINDEX_H_
+#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGINDEX_H_
+
 #include "slang/ast/Compilation.h"
 
 #include "mlir/IR/Attributes.h"
@@ -85,3 +88,5 @@ private:
 };
 }; // namespace lsp
 }; // namespace circt
+
+#endif

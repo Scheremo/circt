@@ -15,7 +15,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#pragma once
+#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVER_H_
+#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVER_H_
+
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LSP/Protocol.h"
 
@@ -80,3 +82,5 @@ private:
 
 } // namespace lsp
 } // namespace circt
+
+#endif

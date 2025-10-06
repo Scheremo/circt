@@ -13,7 +13,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#pragma once
+#ifndef LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVERCONTEXT_H_
+#define LIB_CIRCT_TOOLS_CIRCT_VERILOG_LSP_SERVER_VERILOGSERVERCONTEXT_H_
 
 namespace circt {
 namespace lsp {
@@ -28,3 +29,5 @@ struct VerilogServerContext {
 };
 } // namespace lsp
 } // namespace circt
+
+#endif
