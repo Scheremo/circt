@@ -46,34 +46,67 @@ LogicalResult VerilogTextFile::update(
     const llvm::lsp::URIForFile &uri, int64_t newVersion,
     ArrayRef<llvm::lsp::TextDocumentContentChangeEvent> changes,
     std::vector<llvm::lsp::Diagnostic> &diagnostics) {
-  if (failed(llvm::lsp::TextDocumentContentChangeEvent::applyTo(changes,
-                                                                contents))) {
+
+  LogicalResult applied = failure();
+  {
+    std::unique_lock lk(contentMutex);
+    applied =
+        llvm::lsp::TextDocumentContentChangeEvent::applyTo(changes, contents);
+
+    if (failed(applied)) {
+      circt::lsp::Logger::error(Twine("Failed to update contents of ") +
+                                uri.file());
+      return failure();
+    }
+
+    // If the file contents were properly changed, reinitialize the text file.
+    initialize(uri, newVersion, diagnostics);
+  }
+  if (failed(applied)) {
     circt::lsp::Logger::error(Twine("Failed to update contents of ") +
                               uri.file());
     return failure();
   }
 
-  // If the file contents were properly changed, reinitialize the text file.
-  initialize(uri, newVersion, diagnostics);
   return success();
 }
 
 void VerilogTextFile::initialize(
     const llvm::lsp::URIForFile &uri, int64_t newVersion,
     std::vector<llvm::lsp::Diagnostic> &diagnostics) {
+  std::shared_ptr<VerilogDocument> newDocument;
+  newDocument =
+      std::make_shared<VerilogDocument>(context, uri, contents, diagnostics);
+  setDocument(newDocument);
   version = newVersion;
-  document =
-      std::make_unique<VerilogDocument>(context, uri, contents, diagnostics);
 }
 
 void VerilogTextFile::getLocationsOf(
     const llvm::lsp::URIForFile &uri, llvm::lsp::Position defPos,
     std::vector<llvm::lsp::Location> &locations) {
-  document->getLocationsOf(uri, defPos, locations);
+  auto doc = getDocument();
+  if (doc)
+    doc->getLocationsOf(uri, defPos, locations);
 }
 
 void VerilogTextFile::findReferencesOf(
     const llvm::lsp::URIForFile &uri, llvm::lsp::Position pos,
     std::vector<llvm::lsp::Location> &references) {
-  document->findReferencesOf(uri, pos, references);
+  auto doc = getDocument();
+  if (doc)
+    doc->findReferencesOf(uri, pos, references);
+}
+
+std::shared_ptr<VerilogDocument> VerilogTextFile::getDocument() {
+  std::shared_ptr<circt::lsp::VerilogDocument> doc;
+  {
+    std::unique_lock lk(docMutex);
+    doc = document;
+  }
+  return doc;
+}
+
+void VerilogTextFile::setDocument(std::shared_ptr<VerilogDocument> newDoc) {
+  std::unique_lock lk(docMutex);
+  document = std::move(newDoc);
 }
