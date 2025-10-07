@@ -59,6 +59,9 @@ public:
                         llvm::lsp::Position pos,
                         std::vector<llvm::lsp::Location> &references);
 
+  std::shared_ptr<VerilogDocument> getDocument();
+  void setDocument(std::shared_ptr<VerilogDocument> newDoc);
+
 private:
   /// Initialize the text file from the given file contents.
   void initialize(const llvm::lsp::URIForFile &uri, int64_t newVersion,
@@ -68,13 +71,15 @@ private:
 
   /// The full string contents of the file.
   std::string contents;
+  std::shared_mutex contentMutex;
 
   /// The version of this file.
   int64_t version = 0;
 
   /// The chunks of this file. The order of these chunks is the order in which
   /// they appear in the text file.
-  std::unique_ptr<circt::lsp::VerilogDocument> document;
+  std::shared_ptr<circt::lsp::VerilogDocument> document;
+  std::shared_mutex docMutex;
 };
 
 } // namespace lsp
