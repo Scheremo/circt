@@ -571,16 +571,47 @@ struct RvalueExprVisitor : public ExprVisitor {
     return {};
   }
 
-  // Helper function to convert two arguments to a simple bit vector type and
-  // pass them into a binary op.
+  // Helper function to convert two arguments to a simple bit vector type
+  // and pass them into a binary op.
   template <class ConcreteOp>
   Value createBinary(Value lhs, Value rhs) {
-    lhs = context.convertToSimpleBitVector(lhs);
-    if (!lhs)
-      return {};
-    rhs = context.convertToSimpleBitVector(rhs);
-    if (!rhs)
-      return {};
+
+    // According to IEEE 1800-2023 Section 11.8.1 "Rules for expression types"
+    // and 11.3.1 "Operators with real operands"
+    // the highest types are real types; if neither operand is real-typed,
+    // we can just do all arithmetic with simple bit vectors.
+    if (!isa<moore::RealType>(lhs.getType()) &&
+        !isa<moore::RealType>(rhs.getType())) {
+      lhs = context.convertToSimpleBitVector(lhs);
+      if (!lhs)
+        return {};
+      rhs = context.convertToSimpleBitVector(rhs);
+      if (!rhs)
+        return {};
+      return ConcreteOp::create(builder, loc, lhs, rhs);
+    }
+    // If either operand is real-typed, we need to convert both to real values.
+    auto lhsTy = lhs.getType();
+    auto rhsTy = rhs.getType();
+
+    auto lhsReal = dyn_cast<moore::RealType>(lhsTy);
+    auto rhsReal = dyn_cast<moore::RealType>(rhsTy);
+
+    if (lhsReal || rhsReal) {
+      // Pick the wider of the two real types: 64-bit (real) wins over 32-bit
+      // (shortreal).
+      moore::RealType targetTy;
+      if (lhsReal && rhsReal)
+        targetTy =
+            (lhsReal.getWidth() >= rhsReal.getWidth()) ? lhsReal : rhsReal;
+      else
+        targetTy = lhsReal ? lhsReal : rhsReal;
+
+      if (lhsTy != targetTy)
+        lhs = context.materializeConversion(targetTy, lhs, true, lhs.getLoc());
+      if (rhsTy != targetTy)
+        rhs = context.materializeConversion(targetTy, rhs, true, rhs.getLoc());
+    }
     return ConcreteOp::create(builder, loc, lhs, rhs);
   }
 

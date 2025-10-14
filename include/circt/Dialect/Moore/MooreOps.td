@@ -909,7 +909,17 @@ class BinaryOpBase<string mnemonic, list<Trait> traits = []> :
   }];
 }
 
-def AddOp : BinaryOpBase<"add", [Commutative]> {
+// See IEEE 1800-2023 § 11.3.1 "Operators with real operands".
+class BinaryIntOrRealOpBase<string mnemonic, list<Trait> traits = []> :
+    MooreOp<mnemonic, traits # [Pure, SameOperandsAndResultType]> {
+  let arguments = (ins AnyIntOrRealType:$lhs, AnyIntOrRealType:$rhs);
+  let results = (outs AnyIntOrRealType:$result);
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` type($result)
+  }];
+}
+
+def AddOp : BinaryIntOrRealOpBase<"add", [Commutative]> {
   let summary = "Addition";
   let description = [{
     Add the operands. If any bit in the two operands is Z or X, all bits in the
@@ -919,7 +929,7 @@ def AddOp : BinaryOpBase<"add", [Commutative]> {
   }];
 }
 
-def SubOp : BinaryOpBase<"sub"> {
+def SubOp : BinaryIntOrRealOpBase<"sub"> {
   let summary = "Subtraction";
   let description = [{
     Subtract the right-hand side from the left-hand side operand. If any bit in
@@ -930,7 +940,7 @@ def SubOp : BinaryOpBase<"sub"> {
   let hasFolder = 1;
 }
 
-def MulOp : BinaryOpBase<"mul", [Commutative]> {
+def MulOp : BinaryIntOrRealOpBase<"mul", [Commutative]> {
   let summary = "Multiplication";
   let description = [{
     Multiply the operands. If any bit in the two operands is Z or X, all bits in
@@ -941,7 +951,7 @@ def MulOp : BinaryOpBase<"mul", [Commutative]> {
   let hasFolder = 1;
 }
 
-class DivOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
+class DivOpBase<string mnemonic> : BinaryIntOrRealOpBase<mnemonic> {
   let summary = "Division";
   let description = [{
     Divide the left-hand side by the right-hand side operand. Any fractional
@@ -981,7 +991,7 @@ class ModOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
 def ModUOp : ModOpBase<"modu">;
 def ModSOp : ModOpBase<"mods">;
 
-class PowOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
+class PowOpBase<string mnemonic> : BinaryIntOrRealOpBase<mnemonic> {
   let summary = "Power";
   let description = [{
     Raise the left-hand side to the power of the right-hand side. `powu` treats
@@ -1110,7 +1120,7 @@ def UArrayCmpOp : MooreOp<"uarray_cmp", [
 
     The result is `1` if the comparison is true and `0` otherwise.
   }];
-  let arguments = (ins 
+  let arguments = (ins
     UArrayCmpPredicateAttr:$predicate,
     UnpackedArrayType:$lhs,
     UnpackedArrayType:$rhs
@@ -1168,7 +1178,7 @@ class LogicalEqOpBase<string mnemonic> : MooreOp<mnemonic, [
 
     See IEEE 1800-2017 § 11.4.5 "Equality operators".
   }];
-  let arguments = (ins SimpleBitVectorType:$lhs, SimpleBitVectorType:$rhs);
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
   let results = (outs AnySingleBitType:$result);
   let assemblyFormat = [{
     $lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)
@@ -1265,7 +1275,7 @@ class RelationalOpBase<string mnemonic> : MooreOp<mnemonic, [
 
     See IEEE 1800-2017 § 11.4.4 "Relational operators".
   }];
-  let arguments = (ins SimpleBitVectorType:$lhs, SimpleBitVectorType:$rhs);
+  let arguments = (ins AnyIntOrRealType:$lhs, AnyIntOrRealType:$rhs);
   let results = (outs AnySingleBitType:$result);
   let assemblyFormat = [{
     $lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)

@@ -456,6 +456,9 @@ def SimpleBitVectorType : MooreType<CPred<[{
     llvm::isa<moore::IntType>($_self)
   }]>, "simple bit vector type", "moore::IntType">;
 
+// Union: accepts either IntType or RealType.
+def AnyIntOrRealType : AnyTypeOf<[SimpleBitVectorType, RealType]>;
+
 /// A single two or four-valued bit.
 def AnySingleBitType : MooreType<CPred<[{
     moore::isIntType($_self, 1)
