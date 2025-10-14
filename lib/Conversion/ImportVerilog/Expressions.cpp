@@ -1499,6 +1499,13 @@ Value Context::convertToBool(Value value) {
   return {};
 }
 
+/// Materialize a Slang real literal as a constant op.
+Value Context::materializeSVReal(const slang::real_t &svreal, Location loc) {
+  auto f64Ty = mlir::Float64Type::get(getContext());
+  mlir::FloatAttr attr = mlir::FloatAttr::get(f64Ty, llvm::APFloat(svreal.v));
+  return moore::RealLiteralOp::create(builder, loc, attr);
+}
+
 /// Materialize a Slang integer literal as a constant op.
 Value Context::materializeSVInt(const slang::SVInt &svint,
                                 const slang::ast::Type &astType, Location loc) {
@@ -1579,6 +1586,9 @@ Value Context::materializeConstant(const slang::ConstantValue &constant,
     return materializeFixedSizeUnpackedArrayType(constant, *arr, loc);
   if (constant.isInteger())
     return materializeSVInt(constant.integer(), type, loc);
+  if (constant.isReal() || constant.isShortReal())
+    // Real constants are always materialized as `real`, not `shortreal`.
+    return materializeSVReal(constant.real(), loc);
 
   return {};
 }

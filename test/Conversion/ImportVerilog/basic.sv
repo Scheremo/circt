@@ -3344,3 +3344,11 @@ function automatic void RealConversion(shortreal sr, real r, bit[41:0] i, longin
    // CHECK-Next: [[F2:%.+]] = moore.int_to_real [[IMM2]] : i32 -> f64
    real realTest = real'(logicTest);
 endfunction
+
+// CHECK: func.func private @testRealLiteral() -> !moore.f64 {
+function automatic real testRealLiteral();
+   // CHECK: [[TMP:%.+]] = moore.real_constant 1.234500e+00 : f64
+   localparam test = 1.2345;
+    // CHECK-NEXT: return [[TMP]] : !moore.f64
+   return test;
+endfunction
