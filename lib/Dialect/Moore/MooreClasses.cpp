@@ -19,6 +19,11 @@
 using namespace mlir;
 using namespace circt::moore;
 
+LogicalResult ClassCallOp::verify() { return failure(); }
+LogicalResult ClassVCallOp::verify() { return failure(); }
+LogicalResult ClassUpcastOp::verify() { return failure(); }
+LogicalResult ClassDowncastOp::verify() { return failure(); }
+
 LogicalResult ClassFieldRefOp::verify() {
   // The operand is constrained to ClassHandleRefType in ODS; unwrap it.
   auto instRefTy = cast<RefType>(getInstance().getType());
