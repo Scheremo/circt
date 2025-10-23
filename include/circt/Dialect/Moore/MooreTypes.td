@@ -70,6 +70,15 @@ def ClassHandleType : MooreTypeDef<"ClassHandle", [], "moore::UnpackedType"> {
   }];
   let parameters = (ins AttrParameter<"::mlir::SymbolRefAttr", "class symbol">:$classSym);
   let assemblyFormat = "`<` $classSym `>`";
+  let extraClassDeclaration = [{
+    /// True if this handle’s class is the same as, or derived from, `baseName`.
+    /// `baseName` must be the root symbol name (e.g. @"pkg::Class").
+    bool isSameOrDerivedFrom(::mlir::Operation *anchor,
+                             ::mlir::SymbolRefAttr baseName);
+    /// Find the lowest ancestor of this class which has a property `fieldName`.
+    ClassHandleType ancestorWithProperty(Operation *anchor,
+                                         StringRef fieldName);
+  }];
 }
 
 //===----------------------------------------------------------------------===//

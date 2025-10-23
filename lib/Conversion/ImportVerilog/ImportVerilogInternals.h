@@ -53,6 +53,9 @@ struct FunctionLowering {
   llvm::DenseMap<Value, unsigned> captureIndex;
   bool capturesFinalized = false;
   bool isConverting = false;
+
+  /// Optional callback invoked after finalizeFunctionBodyCaptures().
+  std::function<void(FunctionLowering &)> onFinalize;
 };
 
 // Class lowering information.
@@ -121,8 +124,14 @@ struct Context {
   FunctionLowering *
   declareFunction(const slang::ast::SubroutineSymbol &subroutine);
   ClassLowering *declareClass(const slang::ast::ClassType &cls);
-  LogicalResult convertFunction(const slang::ast::SubroutineSymbol &subroutine);
+  LogicalResult convertFunction(const slang::ast::SubroutineSymbol &subroutine,
+                                FunctionLowering *lowering);
+  FunctionLowering *declareMethod(const slang::ast::SubroutineSymbol &method);
   LogicalResult finalizeFunctionBodyCaptures(FunctionLowering &lowering);
+
+  Value getImplicitThisRef() const {
+    return currentThisRef; // block arg added in declareMethod
+  }
 
   // Convert a statement AST node to MLIR ops.
   LogicalResult convertStatement(const slang::ast::Statement &stmt);
@@ -306,6 +315,13 @@ struct Context {
 
   /// The time scale currently in effect.
   slang::TimeScale timeScale;
+
+private:
+  FunctionLowering *
+  declareCallableImpl(const slang::ast::SubroutineSymbol &subroutine,
+                      mlir::StringRef qualifiedName,
+                      llvm::SmallVectorImpl<Type> &extraParams);
+  Value currentThisRef = {};
 };
 
 } // namespace ImportVerilog

@@ -12,6 +12,7 @@
 #include "slang/ast/Compilation.h"
 #include "slang/ast/symbols/ClassSymbols.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/Format.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -139,7 +140,8 @@ struct RootVisitor : public BaseVisitor {
 
   // Handle functions and tasks.
   LogicalResult visit(const slang::ast::SubroutineSymbol &subroutine) {
-    return context.convertFunction(subroutine);
+    FunctionLowering *lowering = context.declareFunction(subroutine);
+    return context.convertFunction(subroutine, lowering);
   }
 
   // Emit an error for all other members.
@@ -163,7 +165,8 @@ struct ClassVisitor : public BaseVisitor {
 
   // Handle functions and tasks.
   LogicalResult visit(const slang::ast::SubroutineSymbol &subroutine) {
-    return context.convertFunction(subroutine);
+    FunctionLowering *lowering = context.declareFunction(subroutine);
+    return context.convertFunction(subroutine, lowering);
   }
 
   /// Emit an error for all other members.
@@ -187,7 +190,8 @@ struct PackageVisitor : public BaseVisitor {
 
   // Handle functions and tasks.
   LogicalResult visit(const slang::ast::SubroutineSymbol &subroutine) {
-    return context.convertFunction(subroutine);
+    FunctionLowering *lowering = context.declareFunction(subroutine);
+    return context.convertFunction(subroutine, lowering);
   }
 
   /// Emit an error for all other members.
@@ -659,7 +663,8 @@ struct ModuleVisitor : public BaseVisitor {
 
   // Handle functions and tasks.
   LogicalResult visit(const slang::ast::SubroutineSymbol &subroutine) {
-    return context.convertFunction(subroutine);
+    FunctionLowering *lowering = context.declareFunction(subroutine);
+    return context.convertFunction(subroutine, lowering);
   }
 
   /// Emit an error for all other members.
@@ -1001,10 +1006,57 @@ Context::convertPackage(const slang::ast::PackageSymbol &package) {
   return success();
 }
 
+FunctionLowering *
+Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
+  if (!subroutine.thisVar) {
+
+    SmallString<64> name;
+    guessNamespacePrefix(subroutine.getParentScope()->asSymbol(), name);
+    name += subroutine.name;
+
+    SmallVector<Type, 1> noThis = {};
+    return declareCallableImpl(subroutine, name, noThis);
+  }
+
+  auto loc = convertLocation(subroutine.location);
+
+  // Extract 'this' type and ensure it's a class.
+  const slang::ast::Type &thisTy = subroutine.thisVar->getType();
+  moore::ClassDeclOp ownerDecl;
+
+  if (auto *classTy = thisTy.as_if<slang::ast::ClassType>()) {
+    auto &ownerLowering = classes[classTy];
+    ownerDecl = ownerLowering->op;
+  } else {
+    mlir::emitError(loc) << "expected 'this' to be a class type, got "
+                         << thisTy.toString();
+    return {};
+  }
+
+  // Build qualified name: @"Pkg::Class"::subroutine
+  SmallString<64> qualName;
+  qualName += ownerDecl.getSymName(); // already qualified
+  qualName += "::";
+  qualName += subroutine.name;
+
+  // %this : !moore.ref<class.object<@Class>>
+  SmallVector<Type, 1> extraParams;
+  {
+    auto classSym = mlir::FlatSymbolRefAttr::get(ownerDecl.getSymNameAttr());
+    auto handleTy = moore::ClassHandleType::get(getContext(), classSym);
+    extraParams.push_back(moore::RefType::get(handleTy));
+  }
+
+  auto *fLowering = declareCallableImpl(subroutine, qualName, extraParams);
+  return fLowering;
+}
+
 /// Convert a function and its arguments to a function declaration in the IR.
 /// This does not convert the function body.
 FunctionLowering *
-Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
+Context::declareCallableImpl(const slang::ast::SubroutineSymbol &subroutine,
+                             mlir::StringRef qualifiedName,
+                             llvm::SmallVectorImpl<Type> &extraParams) {
   using slang::ast::ArgumentDirection;
 
   // Check if there already is a declaration for this function.
@@ -1026,14 +1078,9 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
   else
     builder.setInsertionPoint(it->second);
 
-  // Class methods are currently not supported.
-  if (subroutine.thisVar) {
-    mlir::emitError(loc) << "unsupported class method";
-    return {};
-  }
-
   // Determine the function type.
   SmallVector<Type> inputTypes;
+  inputTypes.append(extraParams.begin(), extraParams.end());
   SmallVector<Type, 1> outputTypes;
 
   for (const auto *arg : subroutine.getArguments()) {
@@ -1057,14 +1104,9 @@ Context::declareFunction(const slang::ast::SubroutineSymbol &subroutine) {
 
   auto funcType = FunctionType::get(getContext(), inputTypes, outputTypes);
 
-  // Prefix the function name with the surrounding namespace to create somewhat
-  // sane names in the IR.
-  SmallString<64> funcName;
-  guessNamespacePrefix(subroutine.getParentScope()->asSymbol(), funcName);
-  funcName += subroutine.name;
-
   // Create a function declaration.
-  auto funcOp = mlir::func::FuncOp::create(builder, loc, funcName, funcType);
+  auto funcOp =
+      mlir::func::FuncOp::create(builder, loc, qualifiedName, funcType);
   SymbolTable::setSymbolVisibility(funcOp, SymbolTable::Visibility::Private);
   orderedRootOps.insert(it, {subroutine.location, funcOp});
   lowering->op = funcOp;
@@ -1139,18 +1181,14 @@ static LogicalResult rewriteCallSitesToPassCaptures(mlir::func::FuncOp callee,
 
 /// Convert a function.
 LogicalResult
-Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
+Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine,
+                         FunctionLowering *lowering) {
   // Keep track of the local time scale. `getTimeScale` automatically looks
   // through parent scopes to find the time scale effective locally.
   auto prevTimeScale = timeScale;
   timeScale = subroutine.getTimeScale().value_or(slang::TimeScale());
   auto timeScaleGuard =
       llvm::make_scope_exit([&] { timeScale = prevTimeScale; });
-
-  // First get or create the function declaration.
-  auto *lowering = declareFunction(subroutine);
-  if (!lowering)
-    return failure();
 
   // If function already has been finalized, or is already being converted
   // (recursive/re-entrant calls) stop here.
@@ -1162,19 +1200,31 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   // Create a function body block and populate it with block arguments.
   SmallVector<moore::VariableOp> argVariables;
   auto &block = lowering->op.getBody().emplaceBlock();
-  for (auto [astArg, type] :
-       llvm::zip(subroutine.getArguments(),
-                 lowering->op.getFunctionType().getInputs())) {
+
+  // If this is a class method, the first input is %this :
+  // !moore.ref<class.object<@C>>
+  unsigned inputIdx = 0;
+  if (subroutine.thisVar) {
+    auto thisLoc = convertLocation(subroutine.location);
+    auto thisType = lowering->op.getFunctionType().getInput(inputIdx++);
+    auto thisArg = block.addArgument(thisType, thisLoc);
+
+    // Bind `this` so NamedValue/MemberAccess can find it.
+    valueSymbols.insert(subroutine.thisVar, thisArg);
+  }
+
+  // Populate the remaining arguments (skip %this for methods).
+  for (auto [astArg, type] : llvm::zip(
+           subroutine.getArguments(),
+           lowering->op.getFunctionType().getInputs().drop_front(inputIdx))) {
     auto loc = convertLocation(astArg->location);
     auto blockArg = block.addArgument(type, loc);
 
     if (isa<moore::RefType>(type)) {
       valueSymbols.insert(astArg, blockArg);
     } else {
-      // Convert the body of the function.
       OpBuilder::InsertionGuard g(builder);
       builder.setInsertionPointToEnd(&block);
-
       auto shadowArg = moore::VariableOp::create(
           builder, loc, moore::RefType::get(cast<moore::UnpackedType>(type)),
           StringAttr{}, blockArg);
@@ -1250,6 +1300,10 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
     }
   };
 
+  auto savedThis = currentThisRef;
+  currentThisRef = valueSymbols.lookup(subroutine.thisVar);
+  auto restoreThis = llvm::make_scope_exit([&] { currentThisRef = savedThis; });
+
   lowering->isConverting = true;
   auto convertingGuard =
       llvm::make_scope_exit([&] { lowering->isConverting = false; });
@@ -1291,6 +1345,10 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
       var->erase();
     }
   }
+
+  // Notify whoever registered a finalize callback (e.g. class lowering).
+  if (lowering->onFinalize)
+    lowering->onFinalize(*lowering);
 
   lowering->capturesFinalized = true;
   return success();
@@ -1343,43 +1401,6 @@ Context::finalizeFunctionBodyCaptures(FunctionLowering &lowering) {
 }
 
 namespace {
-
-constexpr circt::moore::FieldVisibility
-toFieldVisibility(slang::ast::Visibility v) {
-  switch (v) {
-  case slang::ast::Visibility::Public:
-    return circt::moore::FieldVisibility::Public;
-  case slang::ast::Visibility::Protected:
-    return circt::moore::FieldVisibility::Protected;
-  case slang::ast::Visibility::Local:
-    return circt::moore::FieldVisibility::Local;
-  }
-  llvm_unreachable("unknown Visibility");
-}
-
-constexpr circt::moore::FieldLifetime
-toFieldLifetime(slang::ast::VariableLifetime lt) {
-  switch (lt) {
-  case slang::ast::VariableLifetime::Static:
-    return circt::moore::FieldLifetime::Static;
-  case slang::ast::VariableLifetime::Automatic:
-    return circt::moore::FieldLifetime::Automatic;
-  }
-  llvm_unreachable("Only static and automatic lifetimes exist");
-}
-
-constexpr moore::ClassFlags getClassFlags(const slang::ast::ClassType &sym) {
-  moore::ClassFlags flags = moore::ClassFlags::Concrete;
-
-  if (sym.isAbstract)
-    flags = moore::ClassFlags::Abstract;
-  if (sym.isInterface)
-    flags = moore::ClassFlags::Interface;
-  if (sym.isFinal)
-    flags = moore::ClassFlags::Final;
-
-  return flags;
-}
 
 mlir::StringAttr fullyQualifiedClassName(Context &ctx,
                                          const slang::ast::Type &ty) {
@@ -1444,23 +1465,23 @@ buildBaseAndImplementsAttrs(Context &context,
 struct ClassDeclVisitor {
   Context &context;
   OpBuilder &builder;
-  moore::ClassDeclOp classDecl;
+  ClassLowering &classLowering;
 
-  ClassDeclVisitor(Context &ctx, moore::ClassDeclOp &op)
-      : context(ctx), builder(ctx.builder), classDecl(op) {}
+  ClassDeclVisitor(Context &ctx, ClassLowering &lowering)
+      : context(ctx), builder(ctx.builder), classLowering(lowering) {}
 
   LogicalResult run(const slang::ast::ClassType &classAST) {
     OpBuilder::InsertionGuard ig(builder);
-    Block *body = classDecl.getBody().empty()
-                      ? &classDecl.getBody().emplaceBlock()
-                      : &classDecl.getBody().front();
+    Block *body = classLowering.op.getBody().empty()
+                      ? &classLowering.op.getBody().emplaceBlock()
+                      : &classLowering.op.getBody().front();
     builder.setInsertionPointToEnd(body);
 
     for (const auto &mem : classAST.members())
       if (failed(mem.visit(*this)))
         return failure();
 
-    moore::ClassBodyEndOp::create(builder, classDecl.getLoc());
+    moore::ClassBodyEndOp::create(builder, classLowering.op.getLoc());
 
     return success();
   }
@@ -1472,17 +1493,42 @@ struct ClassDeclVisitor {
     if (!ty)
       return failure();
 
-    moore::FieldLifetime pLifetime = toFieldLifetime(prop.lifetime);
-    moore::FieldVisibility pVisibility = toFieldVisibility(prop.visibility);
-
-    moore::ClassFieldDeclOp::create(builder, loc, prop.name, ty, pVisibility,
-                                    pLifetime);
+    moore::ClassPropertyDeclOp::create(builder, loc, prop.name, ty);
     return success();
   }
 
-  // Methods: SubroutineSymbol
+  // Fully-fledged functions - SubroutineSymbol
   LogicalResult visit(const slang::ast::SubroutineSymbol &fn) {
-    // TODO: Implement support
+    if (fn.flags & slang::ast::MethodFlags::BuiltIn) {
+      static bool remarkEmitted = false;
+      if (remarkEmitted)
+        return success();
+
+      mlir::emitRemark(classLowering.op.getLoc())
+          << "Class builtin functions (needed for randomization, constraints, "
+             "and covergroups) are not yet supported and will be dropped "
+             "during lowering.";
+      remarkEmitted = true;
+      return success();
+    }
+
+    auto loc = convertLocation(fn.location);
+    auto *lowering = context.declareFunction(fn);
+    if (!lowering)
+      return failure();
+
+    if (failed(context.convertFunction(fn, lowering)))
+      return failure();
+
+    if (!lowering->capturesFinalized)
+      return failure();
+
+    // Grab the finalized function type from the lowered func.op.
+    FunctionType fnTy = lowering->op.getFunctionType();
+
+    // Emit the method decl into the class body, preserving source order.
+    moore::ClassMethodDeclOp::create(builder, loc, fn.name, fnTy);
+
     return success();
   }
 
@@ -1537,10 +1583,9 @@ ClassLowering *Context::declareClass(const slang::ast::ClassType &cls) {
 
   auto symName = fullyQualifiedClassName(*this, cls);
   auto [base, impls] = buildBaseAndImplementsAttrs(*this, cls);
-  auto flags = getClassFlags(cls);
 
   auto classDeclOp =
-      moore::ClassDeclOp::create(builder, loc, symName, flags, base, impls);
+      moore::ClassDeclOp::create(builder, loc, symName, base, impls);
 
   SymbolTable::setSymbolVisibility(classDeclOp,
                                    SymbolTable::Visibility::Private);
@@ -1562,7 +1607,7 @@ Context::convertClassDeclaration(const slang::ast::ClassType &classdecl) {
       llvm::make_scope_exit([&] { timeScale = prevTimeScale; });
 
   auto *lowering = declareClass(classdecl);
-  if (failed(ClassDeclVisitor(*this, lowering->op).run(classdecl)))
+  if (failed(ClassDeclVisitor(*this, *lowering).run(classdecl)))
     return failure();
 
   return success();

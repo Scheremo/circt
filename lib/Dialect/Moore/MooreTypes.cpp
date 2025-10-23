@@ -12,8 +12,10 @@
 
 #include "circt/Dialect/Moore/MooreTypes.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
+#include "circt/Dialect/Moore/MooreOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace circt;
@@ -354,6 +356,70 @@ std::optional<uint32_t> RefType::getFieldIndex(StringAttr nameField) {
         return getFieldAllIndex(type.getMembers(), nameField);
       })
       .Default([](auto) { return std::nullopt; });
+}
+
+static moore::ClassDeclOp resolveDecl(Operation *anchor,
+                                      mlir::SymbolRefAttr sym) {
+  if (!anchor || !sym)
+    return nullptr;
+  Operation *op = SymbolTable::lookupNearestSymbolFrom(anchor, sym);
+  return dyn_cast_or_null<ClassDeclOp>(op);
+}
+
+/// True if this handle's class is the same as, or derived from, 'baseSym'.
+bool ClassHandleType::isSameOrDerivedFrom(Operation *anchor,
+                                          mlir::SymbolRefAttr baseName) {
+  if (!anchor || !baseName)
+    return false;
+
+  // Same-class fast path (compare complete SymbolRefAttr, not just the root).
+  auto self = getClassSym();
+  if (self && self == baseName)
+    return true;
+
+  // Follow the base chain via ClassDeclOp::$base (SymbolRefAttr).
+  moore::ClassDeclOp decl = resolveDecl(anchor, self);
+  while (decl) {
+    mlir::SymbolRefAttr curBase = decl.getBaseAttr(); // Optional; may be null
+    if (!curBase)
+      break;
+
+    if (curBase == baseName)
+      return true;
+
+    decl = resolveDecl(anchor, curBase);
+  }
+  return false;
+}
+
+ClassHandleType ClassHandleType::ancestorWithProperty(Operation *anchor,
+                                                      StringRef fieldName) {
+
+  if (!anchor || (fieldName == ""))
+    return {};
+
+  SymbolRefAttr className = getClassSym();
+  moore::ClassPropertyDeclOp fieldDecl;
+  moore::ClassDeclOp classDecl;
+
+  // Iterate up the inheritance tree until we hit an ancestor with the correct
+  // field.
+  while (className) {
+    classDecl = resolveDecl(anchor, className);
+    for (auto &block : classDecl.getBody()) {
+      for (auto &op : block) {
+        fieldDecl = dyn_cast<moore::ClassPropertyDeclOp>(op);
+        if (!fieldDecl)
+          continue;
+
+        if (fieldDecl.getSymName() == fieldName) {
+          return moore::ClassHandleType::get(getContext(), className);
+        }
+      }
+    }
+    className = classDecl.getBaseAttr();
+  }
+  return {};
 }
 
 //===----------------------------------------------------------------------===//

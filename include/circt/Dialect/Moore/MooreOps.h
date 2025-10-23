@@ -21,6 +21,7 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/MemorySlotInterfaces.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 
 #define GET_OP_CLASSES
 // Clang format shouldn't reorder these headers.
