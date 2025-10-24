@@ -1,5 +1,6 @@
 add_circt_conversion_library(CIRCTMooreToCore
   MooreToCore.cpp
+  MooreClassToCore.cpp
 
   DEPENDS
   CIRCTConversionPassIncGen

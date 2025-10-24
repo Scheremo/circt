@@ -34,6 +34,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/DerivedTypes.h"
 
+#include "./MooreClassToCore.h"
+
 namespace circt {
 #define GEN_PASS_DEF_CONVERTMOORETOCORE
 #include "circt/Conversion/Passes.h.inc"
@@ -548,6 +550,43 @@ static Value createZeroValue(Type type, Location loc,
   Value constZero = hw::ConstantOp::create(rewriter, loc, APInt(width, 0));
   return rewriter.createOrFold<hw::BitcastOp>(loc, type, constZero);
 }
+
+
+  LogicalResult matchAndRewrite(ClassDeclOp op, OpAdaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+
+struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
+  ClassDeclOpConversion(TypeConverter &tc, MLIRContext *ctx,
+                        circt::moore::llclass::ClassTypeCache &cache)
+      : OpConversionPattern<ClassDeclOp>(tc, ctx), cache(cache) {}
+
+  LogicalResult matchAndRewrite(ClassDeclOp op, OpAdaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto symRef = SymbolRefAttr::get(op.getSymNameAttr());
+
+    // Phase 1: ensure an identified (possibly opaque) struct exists.
+    mlir::LLVM::LLVMStructType ident;
+    if (auto got = cache.getIdent(symRef))
+      ident = *got;
+    else {
+      ident = LLVM::LLVMStructType::getIdentified(op.getContext(),
+                                                  circt::moore::llclass::mangleClassName(symRef));
+      cache.setIdent(symRef, ident);
+    }
+
+    // Phase 2: set body once (also records field GEP paths in cache).
+    if (ident.isOpaque()) {
+      if (failed(setClassStructBody(op, ident, *typeConverter, cache)))
+        return failure();
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  circt::moore::llclass::ClassTypeCache &cache;  // shared, owned by the pass
+};
 
 struct VariableOpConversion : public OpConversionPattern<VariableOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1157,8 +1196,9 @@ struct CaseXZEqOpConversion : public OpConversionPattern<SourceOp> {
     // Check each operand if it is a known constant and extract the X and/or Z
     // bits to be ignored.
     // TODO: Once the core dialects support four-valued integers, we will have
-    // to create ops that extract X and Z bits from the operands, since we also
-    // have to do the right casez/casex comparison on non-constant inputs.
+    // to create ops that extract X and Z bits from the operands, since we
+    // also have to do the right casez/casex comparison on non-constant
+    // inputs.
     unsigned bitWidth = op.getLhs().getType().getWidth();
     auto ignoredBits = APInt::getZero(bitWidth);
     auto detectIgnoredBits = [&](Value value) {
@@ -1174,8 +1214,8 @@ struct CaseXZEqOpConversion : public OpConversionPattern<SourceOp> {
     detectIgnoredBits(op.getLhs());
     detectIgnoredBits(op.getRhs());
 
-    // If we have detected any bits to be ignored, mask them in the operands for
-    // the comparison.
+    // If we have detected any bits to be ignored, mask them in the operands
+    // for the comparison.
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
     if (!ignoredBits.isZero()) {
@@ -1539,8 +1579,8 @@ struct ConditionalOpConversion : public OpConversionPattern<ConditionalOp> {
                   ConversionPatternRewriter &rewriter) const override {
     // TODO: This lowering is only correct if the condition is two-valued. If
     // the condition is X or Z, both branches of the conditional must be
-    // evaluated and merged with the appropriate lookup table. See documentation
-    // for `ConditionalOp`.
+    // evaluated and merged with the appropriate lookup table. See
+    // documentation for `ConditionalOp`.
     auto type = typeConverter->convertType(op.getType());
 
     auto hasNoWriteEffect = [](Region &region) {
@@ -1876,6 +1916,11 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
   typeConverter.addConversion(
       [](LLVM::LLVMPointerType t) -> std::optional<Type> { return t; });
 
+  // 1) ClassHandleType  ->  !llvm.ptr
+  typeConverter.addConversion([&](ClassHandleType type) -> std::optional<Type> {
+    return mlir::LLVM::LLVMPointerType::get(type.getContext());
+  });
+
   typeConverter.addConversion([&](RefType type) -> std::optional<Type> {
     if (auto innerType = typeConverter.convertType(type.getNestedType()))
       return llhd::RefType::get(innerType);
@@ -1936,9 +1981,16 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
 }
 
 static void populateOpConversion(ConversionPatternSet &patterns,
-                                 TypeConverter &typeConverter) {
+                                 TypeConverter &typeConverter,
+                                 llclass::ClassTypeCache &classCache) {
+
+  patterns.add<ClassDeclOpConversion>(typeConverter, patterns.getContext(),
+                                      classCache);
+
   // clang-format off
   patterns.add<
+    ClassUpcastOpConversion,
+    ClassNewOpConversion,
     // Patterns of declaration operations.
     VariableOpConversion,
     NetOpConversion,
@@ -2099,6 +2151,7 @@ std::unique_ptr<OperationPass<ModuleOp>> circt::createConvertMooreToCorePass() {
 void MooreToCorePass::runOnOperation() {
   MLIRContext &context = getContext();
   ModuleOp module = getOperation();
+  llclass::ClassTypeCache classCache;
 
   IRRewriter rewriter(module);
   (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
@@ -2109,8 +2162,15 @@ void MooreToCorePass::runOnOperation() {
   ConversionTarget target(context);
   populateLegality(target, typeConverter);
 
+  module.walk([&](moore::ClassDeclOp op) {
+    auto sym = SymbolRefAttr::get(op.getSymNameAttr());
+    auto ident = llclass::getOrCreateOpaqueStruct(&context, sym);
+    (void)classCache.setIdent(sym, ident);
+    (void)llclass::setClassStructBody(op, ident, typeConverter, classCache);
+  });
+
   ConversionPatternSet patterns(&context, typeConverter);
-  populateOpConversion(patterns, typeConverter);
+  populateOpConversion(patterns, typeConverter, classCache);
 
   if (failed(applyFullConversion(module, target, std::move(patterns))))
     signalPassFailure();
