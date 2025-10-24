@@ -551,6 +551,29 @@ static Value createZeroValue(Type type, Location loc,
   return rewriter.createOrFold<hw::BitcastOp>(loc, type, constZero);
 }
 
+struct ClassUpcastOpConversion : public OpConversionPattern<ClassUpcastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ClassUpcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Expect lowered types like llhd.ref<!llvm.ptr>.
+    Type dstTy = getTypeConverter()->convertType(op.getResult().getType());
+    Type srcTy = adaptor.getInstance().getType();
+
+    if (!dstTy)
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+
+    // If the types are already identical (opaque pointer mode), just forward.
+    if (dstTy == srcTy) {
+      rewriter.replaceOp(op, adaptor.getInstance());
+      return success();
+    }
+    return rewriter.notifyMatchFailure(
+        op, "Upcast applied to non-opaque pointers!");
+  }
+};
+
 /// moore.class.new lowering: heap-allocate storage for the class object.
 struct ClassNewOpConversion : public OpConversionPattern<ClassNewOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -591,8 +614,8 @@ struct ClassNewOpConversion : public OpConversionPattern<ClassNewOp> {
     auto call = rewriter.create<LLVM::CallOp>(
         loc, TypeRange{ptrTy}, SymbolRefAttr::get(mallocFn), ValueRange{cSize});
 
-    // 4) Replace the new op with the malloc pointer (no cast needed with opaque
-    // ptrs).
+    // 4) Replace the new op with the malloc pointer (no cast needed with
+    // opaque ptrs).
     rewriter.replaceOp(op, call.getResult());
     return success();
   }

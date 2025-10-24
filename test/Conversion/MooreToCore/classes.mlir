@@ -58,3 +58,27 @@ module {
     return
   }
 }
+
+/// Check that upcast lowers to nop
+
+// CHECK: func.func @f(
+// CHECK-SAME: %[[ARG:.*]]: !llhd.ref<!llvm.ptr>) -> !llhd.ref<!llvm.ptr> {
+// CHECK-NEXT:   return %[[ARG]] : !llhd.ref<!llvm.ptr>
+// CHECK-NEXT: }
+
+// CHECK-NOT: moore.class.upcast
+// CHECK-NOT: moore.class.classdecl
+
+module {
+  // Minimal hierarchy so the upcast is well-typed pre-conversion.
+  moore.class.classdecl @B : { }
+  moore.class.classdecl @D extends @B : { }
+
+  // Upcast from D to B.
+  func.func @f(%r: !moore.ref<!moore.class.object<@D>>)
+              -> !moore.ref<!moore.class.object<@B>> {
+    %u = moore.class.upcast %r
+         : <class.object<@D>> to <class.object<@B>>
+    return %u : !moore.ref<!moore.class.object<@B>>
+  }
+}
