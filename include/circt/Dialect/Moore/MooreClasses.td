@@ -77,4 +77,23 @@ def ClassNewOp
   let hasVerifier = 1;
 }
 
+def ClassPropertyRefOp : MooreOp<"class.property_ref", [Pure]> {
+  let summary = "Get a !moore.ref to a class property";
+  let arguments = (ins ClassHandleRefType:$instance,
+      FlatSymbolRefAttr:$property);
+  let results = (outs RefType:$propertyRef);
+  let assemblyFormat = "$instance`[`$property`]` `:` type($instance) `->` "
+                       "type($propertyRef) attr-dict";
+  let hasVerifier = 1;
+}
+
+def ClassUpcastOp : MooreOp<"class.upcast", [Pure]> {
+  let summary = "Upcast a derived handle to a base handle (zero-cost)";
+  let arguments = (ins ClassHandleRefType:$instance);
+  let results = (outs ClassHandleRefType:$result);
+  let assemblyFormat =
+      "$instance `:` type($instance) `to` type($result) attr-dict";
+  let hasVerifier = 1;
+}
+
 #endif // CIRCT_DIALECT_MOORE_MOORECLASSES
