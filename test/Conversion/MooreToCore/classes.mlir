@@ -61,7 +61,7 @@ module {
 
 /// Check that upcast lowers to nop
 
-// CHECK: func.func @f(
+// CHECK-LABEL: func.func @f(
 // CHECK-SAME: %[[ARG:.*]]: !llhd.ref<!llvm.ptr>) -> !llhd.ref<!llvm.ptr> {
 // CHECK-NEXT:   return %[[ARG]] : !llhd.ref<!llvm.ptr>
 // CHECK-NEXT: }
@@ -80,5 +80,34 @@ module {
     %u = moore.class.upcast %r
          : <class.object<@D>> to <class.object<@B>>
     return %u : !moore.ref<!moore.class.object<@B>>
+  }
+}
+
+/// Check that property_ref lowers to GEP
+
+// CHECK-LABEL: func.func @get_a(
+// CHECK-SAME: %arg0: !llhd.ref<!llvm.ptr>) -> i32 {
+// CHECK: %[[OBJ:.*]] = llhd.prb %arg0 : !llvm.ptr
+// CHECK: %[[C0A:.*]] = llvm.mlir.constant(0 : i32) : i32
+// CHECK: %[[C0B:.*]] = llvm.mlir.constant(0 : i32) : i32
+// CHECK: %[[GEP:.*]] = llvm.getelementptr %[[OBJ]][%[[C0A]], 0]
+// CHECK-SAME: : (!llvm.ptr, i32) -> !llvm.ptr, !llvm.struct<"moore.class.CHere", (i32)>
+// CHECK: %[[REF:.*]] = builtin.unrealized_conversion_cast %[[GEP]] : !llvm.ptr to !llhd.ref<i32>
+// CHECK: %[[VAL:.*]] = llhd.prb %[[REF]] : i32
+// CHECK: return %[[VAL]] : i32
+
+// CHECK-NOT: moore.class.property_ref
+// CHECK-NOT: moore.class.classdecl
+
+module {
+  moore.class.classdecl @CHere : {
+    moore.class.propertydecl @a : !moore.i32
+  }
+
+  // Take &C::a and load it.
+  func.func @get_a(%this: !moore.ref<!moore.class.object<@CHere>>) -> !moore.i32 {
+    %p = moore.class.property_ref %this[@a] : <class.object<@CHere>> -> <i32>
+    %v = moore.read %p : <i32>
+    return %v : !moore.i32
   }
 }

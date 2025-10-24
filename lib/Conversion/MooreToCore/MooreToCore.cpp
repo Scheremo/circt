@@ -551,6 +551,76 @@ static Value createZeroValue(Type type, Location loc,
   return rewriter.createOrFold<hw::BitcastOp>(loc, type, constZero);
 }
 
+struct ClassPropertyRefOpConversion
+    : public OpConversionPattern<circt::moore::ClassPropertyRefOp> {
+  ClassPropertyRefOpConversion(TypeConverter &tc, MLIRContext *ctx,
+                               circt::moore::llclass::ClassTypeCache &cache)
+      : OpConversionPattern(tc, ctx), cache(cache) {}
+
+  LogicalResult matchAndRewrite(circt::moore::ClassPropertyRefOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    // Convert result type; we expect !llhd.ref<!llvm.ptr>.
+    Type dstTy = getTypeConverter()->convertType(op.getPropertyRef().getType());
+    auto dstRefTy = dyn_cast<llhd::RefType>(dstTy);
+    if (!dstRefTy)
+      return rewriter.notifyMatchFailure(op, "result must lower to !llhd.ref<T>");
+
+    // Operand is a ref<ptr> too; probe to get the raw !llvm.ptr for GEP.
+    Value instRef = adaptor.getInstance();
+    auto instRefTy = dyn_cast<llhd::RefType>(instRef.getType());
+    if (!instRefTy || !isa<LLVM::LLVMPointerType>(instRefTy.getNestedType()))
+      return rewriter.notifyMatchFailure(op, "instance must be !llhd.ref<!llvm.ptr>");
+
+    Value objPtr = rewriter.create<llhd::ProbeOp>(loc, LLVM::LLVMPointerType::get(ctx), instRef);
+
+    // Resolve identified struct + field GEP path from cache.
+    auto classRefTy = cast<circt::moore::RefType>(op.getInstance().getType());
+    auto classHdlTy = cast<circt::moore::ClassHandleType>(classRefTy.getNestedType());
+    SymbolRefAttr classSym = classHdlTy.getClassSym();
+
+    auto identOpt = cache.getIdent(classSym);
+    if (!identOpt)
+      return rewriter.notifyMatchFailure(op, "identified struct missing in cache");
+    LLVM::LLVMStructType ident = *identOpt;
+    if (ident.isOpaque())
+      return rewriter.notifyMatchFailure(op, "identified struct still opaque");
+
+    auto pathOpt = cache.getFieldPath(classSym, op.getPropertyAttr());
+    if (!pathOpt)
+      return rewriter.notifyMatchFailure(op, "no field path cached for property");
+    ArrayRef<unsigned> path = *pathOpt;
+
+    // Build indices: leading 0 (ptr-to-struct), then the cached path.
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto cst = [&](unsigned v) {
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty, rewriter.getI32IntegerAttr(v));
+    };
+    SmallVector<Value> idx;
+    idx.push_back(cst(0));
+    for (unsigned v : path) idx.push_back(cst(v));
+
+    // Opaque-pointer mode GEPOp: (resultType, elementType, basePtr, indices, flags)
+    auto gep = rewriter.create<LLVM::GEPOp>(
+        loc, LLVM::LLVMPointerType::get(ctx), ident, objPtr, idx,
+        mlir::LLVM::GEPNoWrapFlags::none);
+
+    // Wrap pointer back to !llhd.ref<!llvm.ptr> (bridge).
+    Value fieldRef = rewriter
+                         .create<UnrealizedConversionCastOp>(loc, dstTy, gep.getResult())
+                         .getResult(0);
+
+    rewriter.replaceOp(op, fieldRef);
+    return success();
+  }
+
+private:
+  circt::moore::llclass::ClassTypeCache &cache;
+};
+
 struct ClassUpcastOpConversion : public OpConversionPattern<ClassUpcastOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -626,8 +696,9 @@ struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
                         circt::moore::llclass::ClassTypeCache &cache)
       : OpConversionPattern<ClassDeclOp>(tc, ctx), cache(cache) {}
 
-  LogicalResult matchAndRewrite(ClassDeclOp op, OpAdaptor,
-                                ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(ClassDeclOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     auto symRef = SymbolRefAttr::get(op.getSymNameAttr());
 
     // Phase 1: ensure an identified (possibly opaque) struct exists.
@@ -635,8 +706,8 @@ struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
     if (auto got = cache.getIdent(symRef))
       ident = *got;
     else {
-      ident = LLVM::LLVMStructType::getIdentified(op.getContext(),
-                                                  circt::moore::llclass::mangleClassName(symRef));
+      ident = LLVM::LLVMStructType::getIdentified(
+          op.getContext(), circt::moore::llclass::mangleClassName(symRef));
       cache.setIdent(symRef, ident);
     }
 
@@ -651,7 +722,7 @@ struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
   }
 
 private:
-  circt::moore::llclass::ClassTypeCache &cache;  // shared, owned by the pass
+  circt::moore::llclass::ClassTypeCache &cache; // shared, owned by the pass
 };
 
 struct VariableOpConversion : public OpConversionPattern<VariableOp> {
@@ -2051,6 +2122,8 @@ static void populateOpConversion(ConversionPatternSet &patterns,
                                  llclass::ClassTypeCache &classCache) {
 
   patterns.add<ClassDeclOpConversion>(typeConverter, patterns.getContext(),
+                                      classCache);
+  patterns.add<ClassPropertyRefOpConversion>(typeConverter, patterns.getContext(),
                                       classCache);
 
   // clang-format off
