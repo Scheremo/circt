@@ -551,9 +551,52 @@ static Value createZeroValue(Type type, Location loc,
   return rewriter.createOrFold<hw::BitcastOp>(loc, type, constZero);
 }
 
+/// moore.class.new lowering: heap-allocate storage for the class object.
+struct ClassNewOpConversion : public OpConversionPattern<ClassNewOp> {
+  using OpConversionPattern::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(ClassDeclOp op, OpAdaptor,
-                                ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(ClassNewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    // 1) Resolve the identified struct for the class (must be declared).
+    auto handleTy = dyn_cast<ClassHandleType>(op.getResult().getType());
+    if (!handleTy)
+      return rewriter.notifyMatchFailure(op, "result is not a ClassHandleType");
+
+    auto sym = handleTy.getClassSym();
+    std::string name = llclass::mangleClassName(sym);
+
+    auto structTy = mlir::LLVM::LLVMStructType::getIdentified(ctx, name);
+
+    if (structTy.isOpaque()) {
+      return rewriter.notifyMatchFailure(
+          op, "class struct is still opaque; cannot compute size");
+    }
+
+    // 2) Compute ABI size in bytes from MLIR data layout.
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    DataLayout dl(module);
+    // DataLayout::getTypeSize gives a byte count for LLVM types.
+    uint64_t byteSize = dl.getTypeSize(structTy);
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto cSize = rewriter.create<LLVM::ConstantOp>(
+        loc, i64Ty, rewriter.getI64IntegerAttr(byteSize));
+
+    // 3) Get or declare malloc and call it.
+    auto mallocFn = circt::moore::llclass::getOrCreateMalloc(module, rewriter);
+    auto ptrTy = mlir::LLVM::LLVMPointerType::get(ctx); // opaque pointer result
+    auto call = rewriter.create<LLVM::CallOp>(
+        loc, TypeRange{ptrTy}, SymbolRefAttr::get(mallocFn), ValueRange{cSize});
+
+    // 4) Replace the new op with the malloc pointer (no cast needed with opaque
+    // ptrs).
+    rewriter.replaceOp(op, call.getResult());
+    return success();
+  }
+};
 
 struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
   ClassDeclOpConversion(TypeConverter &tc, MLIRContext *ctx,

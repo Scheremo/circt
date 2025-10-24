@@ -15,6 +15,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 
 namespace mlir {
 class MLIRContext;
@@ -90,6 +91,8 @@ struct ClassTypeCache {
     return std::nullopt; // derived or inherited needs full path
   }
 };
+
+mlir::LLVM::LLVMFuncOp getOrCreateMalloc(mlir::ModuleOp module, mlir::OpBuilder &b);
 
 /// Mangle a stable, LLVM-safe identified name from a class symbol.
 /// e.g. @"pkg::Outer::C" → "moore.class.pkg.Outer.C"
