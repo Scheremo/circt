@@ -30,6 +30,19 @@ def ClassPropertyDeclOp
   }];
 }
 
+def ClassMethodDeclOp
+    : MooreOp<"class.methoddecl", [Symbol, HasParent<"ClassDeclOp">]> {
+  let summary = "Declare a class method";
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+      TypeAttrOf<FunctionType>:$function_type);
+
+  let results = (outs);
+  let assemblyFormat = [{
+      $sym_name `:` $function_type  attr-dict
+  }];
+}
+
 def ClassBodyEndOp
     : MooreOp<"class.declend", [Terminator, HasParent<"ClassDeclOp">]> {
   let summary = "end of classdecl region";
@@ -94,6 +107,49 @@ def ClassUpcastOp : MooreOp<"class.upcast", [Pure]> {
   let assemblyFormat =
       "$instance `:` type($instance) `to` type($result) attr-dict";
   let hasVerifier = 1;
+}
+
+// moore.class.call @C::m(%inst, args) : (types) -> (results)
+// Direct, non-virtual call. Uses CallOpInterface.
+
+def ClassCallOp
+    : MooreOp<"class.call", [CallOpInterface, ArgAndResultAttrsOpInterface]> {
+  let summary = "Direct call to a (non-virtual) class method";
+  let arguments = (ins SymbolRefAttr:$callee, Variadic<AnyType>:$operands);
+  let results = (outs Variadic<AnyType>:$results);
+  let assemblyFormat = "$callee `(` $operands `)` `:` `(`type($operands)`)` "
+                       "`->` `(` type($results) `)` attr-dict";
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getOperands();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getOperandsMutable();
+    }
+
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return CallInterfaceCallable(getCalleeAttr());
+    }
+
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+         if (auto sym = callee.dyn_cast<mlir::SymbolRefAttr>())
+            setCalleeAttr(sym);
+         else
+             llvm_unreachable("Expected SymbolRefAttr for callee");
+    }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
 }
 
 #endif // CIRCT_DIALECT_MOORE_MOORECLASSES

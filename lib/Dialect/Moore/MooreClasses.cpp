@@ -94,7 +94,8 @@ LogicalResult ClassDeclOp::verify() {
 
     // allow only property and method decls and terminator
     if (llvm::isa<circt::moore::ClassBodyEndOp,
-                  circt::moore::ClassPropertyDeclOp>(&op))
+                  circt::moore::ClassPropertyDeclOp,
+                  circt::moore::ClassMethodDeclOp>(&op))
       continue;
 
     return emitOpError()
@@ -216,6 +217,45 @@ LogicalResult ClassPropertyRefOp::verify() {
     return emitOpError("result element type (")
            << resRefTy.getNestedType() << ") does not match field type ("
            << expectedElemTy << ")";
+
+  return success();
+}
+
+LogicalResult ClassCallOp::verify() {
+  // Resolve callee -> func.func
+  auto calleeSym = getCalleeAttr();
+  if (!calleeSym)
+    return emitOpError("missing `callee`");
+
+  Operation *opSym = lookupNearest(getOperation(), calleeSym);
+  if (!opSym)
+    return emitOpError("callee symbol `") << calleeSym << "` was not found";
+
+  auto fn = dyn_cast<mlir::FunctionOpInterface>(opSym);
+  if (!fn)
+    return emitOpError("callee `")
+           << calleeSym << "` is not a function-like op";
+
+  auto fnType = dyn_cast<mlir::FunctionType>(fn.getFunctionType());
+  if (!fnType)
+    return emitOpError("callee `")
+           << calleeSym << "` does not have FunctionType";
+
+  // Check arity
+  if (fnType.getNumInputs() != static_cast<unsigned int>(getOperands().size()))
+    return emitOpError("expected ")
+           << fnType.getNumInputs() << " operands, got "
+           << getOperands().size();
+
+  // Check each operand type matches the function input type (1:1)
+  for (auto [i, pair] :
+       llvm::enumerate(llvm::zip(getOperands(), fnType.getInputs()))) {
+    auto [arg, expectedTy] = pair;
+    if (arg.getType() != expectedTy)
+      return emitOpError("operand #")
+             << i << " type " << arg.getType()
+             << " does not match callee input type " << expectedTy;
+  }
 
   return success();
 }

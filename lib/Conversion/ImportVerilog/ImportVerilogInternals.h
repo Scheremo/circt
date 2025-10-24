@@ -122,7 +122,9 @@ struct Context {
   LogicalResult finalizeFunctionBodyCaptures(FunctionLowering &lowering);
   LogicalResult convertClassDeclaration(const slang::ast::ClassType &classdecl);
   ClassLowering *declareClass(const slang::ast::ClassType &cls);
-
+  Value getImplicitThisRef() const {
+    return currentThisRef; // block arg added in declareMethod
+  }
   // Convert a statement AST node to MLIR ops.
   LogicalResult convertStatement(const slang::ast::Statement &stmt);
 
@@ -305,6 +307,17 @@ struct Context {
 
   /// The time scale currently in effect.
   slang::TimeScale timeScale;
+
+private:
+  /// Helper function to extract the commonalities in lowering of functions and
+  /// methods
+  FunctionLowering *
+  declareCallableImpl(const slang::ast::SubroutineSymbol &subroutine,
+                      mlir::StringRef qualifiedName,
+                      llvm::SmallVectorImpl<Type> &extraParams);
+  /// Variable to track the value of the current functions implicit this
+  /// reference
+  Value currentThisRef = {};
 };
 
 } // namespace ImportVerilog

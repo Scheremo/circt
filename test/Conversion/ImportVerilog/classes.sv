@@ -262,3 +262,151 @@ module testModule6;
         result = t.a;
     end
 endmodule
+
+/// Check concrete method calls
+
+// CHECK-LABEL: moore.module @testModule7() {
+// CHECK: [[T:%.*]] = moore.variable : <class.object<@"testModule7::testModuleClass">>
+// CHECK: [[RESULT:%.+]] = moore.variable : <i32>
+// CHECK: moore.procedure initial {
+// CHECK:    [[NEW:%.*]] = moore.class.new : <@"testModule7::testModuleClass">
+// CHECK:    moore.blocking_assign [[T]], [[NEW]] : class.object<@"testModule7::testModuleClass">
+// CHECK:    [[FUNCRET:%.+]] = moore.class.call @"testModule7::testModuleClass::returnA"([[T]]) : (!moore.ref<class.object<@"testModule7::testModuleClass">>) -> (!moore.i32)
+// CHECK:    moore.blocking_assign [[RESULT]], [[FUNCRET]] : i32
+// CHECK:    moore.return
+// CHECK: }
+// CHECK: moore.output
+// CHECK: }
+
+// CHECK: moore.class.classdecl @"testModule7::testModuleClass" : {
+// CHECK-NEXT: moore.class.propertydecl @a : !moore.i32
+// CHECK-NEXT: moore.class.methoddecl @returnA : (!moore.ref<class.object<@"testModule7::testModuleClass">>) -> !moore.i32
+// CHECK: }
+
+// CHECK: func.func private @"testModule7::testModuleClass::returnA"
+// CHECK-SAME: ([[ARG:%.+]]: !moore.ref<class.object<@"testModule7::testModuleClass">>)
+// CHECK-SAME: -> !moore.i32 {
+// CHECK-NEXT: [[REF:%.+]] = moore.class.property_ref [[ARG]][@a] : <class.object<@"testModule7::testModuleClass">> -> <i32>
+// CHECK-NEXT: [[RETURN:%.+]] = moore.read [[REF]] : <i32>
+// CHECK-NEXT: return [[RETURN]] : !moore.i32
+// CHECK-NEXT: }
+
+module testModule7;
+    class testModuleClass;
+       int a;
+       function int returnA();
+          return a;
+       endfunction
+    endclass
+    testModuleClass t;
+    int result;
+    initial begin
+        t = new;
+        result = t.returnA();
+    end
+endmodule
+
+
+/// Check inherited property access
+
+ // CHECK-LABEL: moore.module @testModule8() {
+ // CHECK:    [[t:%.+]] = moore.variable : <class.object<@"testModule8::testModuleClass2">>
+ // CHECK:    [[result:%.+]] = moore.variable : <i32>
+ // CHECK:    moore.procedure initial {
+ // CHECK:      [[NEW:%.+]] = moore.class.new : <@"testModule8::testModuleClass2">
+ // CHECK:      moore.blocking_assign [[t]], [[NEW]] : class.object<@"testModule8::testModuleClass2">
+// CHECK:       [[CALL:%.+]] = moore.class.call @"testModule8::testModuleClass2::returnA"([[t]]) : (!moore.ref<class.object<@"testModule8::testModuleClass2">>) -> (!moore.i32)
+// CHECK:       moore.blocking_assign [[result]], [[CALL]] : i32
+ // CHECK:      moore.return
+ // CHECK:    }
+ // CHECK:    moore.output
+ // CHECK:  }
+ // CHECK:  moore.class.classdecl @"testModule8::testModuleClass" : {
+ // CHECK:    moore.class.propertydecl @a : !moore.i32
+ // CHECK:  }
+ // CHECK:  moore.class.classdecl @"testModule8::testModuleClass2" extends @"testModule8::testModuleClass" : {
+ // CHECK:    moore.class.methoddecl @returnA : (!moore.ref<class.object<@"testModule8::testModuleClass2">>) -> !moore.i32
+ // CHECK:  }
+ // CHECK:  func.func private @"testModule8::testModuleClass2::returnA"([[ARG:%.+]]: !moore.ref<class.object<@"testModule8::testModuleClass2">>) -> !moore.i32 {
+ // CHECK:   [[UPCAST:%.+]] = moore.class.upcast [[ARG]] : <class.object<@"testModule8::testModuleClass2">> to <class.object<@"testModule8::testModuleClass">>
+ // CHECK:   [[PROPREF:%.+]] = moore.class.property_ref [[UPCAST]][@a] : <class.object<@"testModule8::testModuleClass">> -> <i32>
+ // CHECK:   [[RET:%.+]] = moore.read [[PROPREF]] : <i32>
+ // CHECK:   return [[RET]] : !moore.i32
+ // CHECK: }
+
+module testModule8;
+
+    class testModuleClass;
+       int a;
+    endclass // testModuleClass
+
+   class testModuleClass2 extends testModuleClass;
+       function int returnA();
+          return a;
+       endfunction
+   endclass // testModuleClass2
+
+    testModuleClass2 t;
+    int result;
+    initial begin
+        t = new;
+        result = t.returnA();
+    end
+
+endmodule
+
+/// Check method lowering without qualified handle
+
+// CHECK-LABEL: moore.module @testModule9() {
+// CHECK: [[t:%.+]] = moore.variable : <class.object<@"testModule9::testModuleClass2">>
+// CHECK: [[result:%.+]] = moore.variable : <i32>
+// CHECK: moore.procedure initial {
+// CHECK:   [[new_obj:%.+]] = moore.class.new : <@"testModule9::testModuleClass2">
+// CHECK:   moore.blocking_assign [[t]], [[new_obj]] : class.object<@"testModule9::testModuleClass2">
+// CHECK:   [[call_ret:%.+]] = moore.class.call @"testModule9::testModuleClass2::returnA"([[t]]) : (!moore.ref<class.object<@"testModule9::testModuleClass2">>) -> (!moore.i32)
+// CHECK:   moore.blocking_assign [[result]], [[call_ret]] : i32
+// CHECK:   moore.return
+// CHECK: }
+// CHECK: moore.output
+// CHECK: }
+// CHECK: moore.class.classdecl @"testModule9::testModuleClass" : {
+// CHECK:   moore.class.propertydecl @a : !moore.i32
+// CHECK:   moore.class.methoddecl @myReturn : (!moore.ref<class.object<@"testModule9::testModuleClass">>) -> !moore.i32
+// CHECK: }
+// CHECK: func.func private @"testModule9::testModuleClass::myReturn"([[this_ref:%.+]]: !moore.ref<class.object<@"testModule9::testModuleClass">>) -> !moore.i32 {
+// CHECK:   [[prop_ref:%.+]] = moore.class.property_ref [[this_ref]][@a] : <class.object<@"testModule9::testModuleClass">> -> <i32>
+// CHECK:   [[read_val:%.+]] = moore.read [[prop_ref]] : <i32>
+// CHECK:   return [[read_val]] : !moore.i32
+// CHECK: }
+// CHECK: moore.class.classdecl @"testModule9::testModuleClass2" extends @"testModule9::testModuleClass" : {
+// CHECK:   moore.class.methoddecl @returnA : (!moore.ref<class.object<@"testModule9::testModuleClass2">>) -> !moore.i32
+// CHECK: }
+// CHECK: func.func private @"testModule9::testModuleClass2::returnA"([[this_ref2:%.+]]: !moore.ref<class.object<@"testModule9::testModuleClass2">>) -> !moore.i32 {
+// CHECK:   [[upcast_ref:%.+]] = moore.class.upcast [[this_ref2]] : <class.object<@"testModule9::testModuleClass2">> to <class.object<@"testModule9::testModuleClass">>
+// CHECK:   [[call_myReturn:%.+]] = moore.class.call @"testModule9::testModuleClass::myReturn"([[upcast_ref]]) : (!moore.ref<class.object<@"testModule9::testModuleClass">>) -> (!moore.i32)
+// CHECK:   return [[call_myReturn]] : !moore.i32
+// CHECK: }
+
+module testModule9;
+
+    class testModuleClass;
+       int a;
+       function int myReturn();
+          return a;
+       endfunction; // myReturn
+    endclass // testModuleClass
+
+   class testModuleClass2 extends testModuleClass;
+       function int returnA();
+          return myReturn();
+       endfunction
+   endclass // testModuleClass2
+
+    testModuleClass2 t;
+    int result;
+    initial begin
+        t = new;
+        result = t.returnA();
+    end
+
+endmodule
