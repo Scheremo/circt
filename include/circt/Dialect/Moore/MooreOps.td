@@ -85,7 +85,7 @@ def SVModuleOp : MooreOp<"module", [
     /// Return the list of values assigned to output ports.
     OperandRange getOutputs();
     /// Implement RegionKindInterface.
-    static RegionKind getRegionKind(unsigned index) { 
+    static RegionKind getRegionKind(unsigned index) {
       return RegionKind::Graph;
     }
   }];
@@ -278,7 +278,7 @@ def NetOp : MooreOp<"net", [
     assignments and continuous assign statements. It has some features that are
     not supported: declaring an interconnect net and using user-defined types in
     the net operation.
-    
+
     See IEEE 1800-2017 § 6.7 "Net declarations".
   }];
   let arguments = (ins
@@ -315,7 +315,7 @@ def ReadOp : MooreOp<"read", [
   let summary = "Read the current value of a declaration";
   let description = [{
     Samples the current value of a declaration. This is a helper to capture the
-    exact point at which declarations that can be targeted by all possible 
+    exact point at which declarations that can be targeted by all possible
     expressions are read. It's similar to llvm.load.
   }];
   let arguments = (ins Arg<RefType, "", [MemRead]>:$input);
@@ -1193,7 +1193,7 @@ def UArrayCmpOp : MooreOp<"uarray_cmp", [
 
     The result is `1` if the comparison is true and `0` otherwise.
   }];
-  let arguments = (ins 
+  let arguments = (ins
     UArrayCmpPredicateAttr:$predicate,
     UnpackedArrayType:$lhs,
     UnpackedArrayType:$rhs
@@ -1201,7 +1201,7 @@ def UArrayCmpOp : MooreOp<"uarray_cmp", [
   let results = (outs BitType:$result);
   let assemblyFormat = [{
     $predicate $lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)
-  }];  
+  }];
 }
 
 def StringCmpOp : MooreOp<"string_cmp", [
@@ -1420,7 +1420,7 @@ def ReplicateOp : MooreOp<"replicate", [
 ]> {
   let summary = "Multiple concatenation of expressions";
   let description = [{
-    This operation indicates a joining together of that many copies of the 
+    This operation indicates a joining together of that many copies of the
     concatenation `{constant{w}}`. Which enclosed together within brace.
     The 'constant' must a non-negative, non-x, and non-z constant expression.
     The 'constant' may be a value of zero, but it only exists in parameterized
@@ -1555,11 +1555,11 @@ def ExtractOp : MooreOp<"extract", [Pure]> {
   let summary = "Extract a range or single bits from a value";
   let description = [{
     It's used to select from a value with a constant low bit.
-    This operation includes the vector bit/part-select, array, and memory 
+    This operation includes the vector bit/part-select, array, and memory
     addressing.If the address is invalid--out of bounds or has x or z bit--
     then it will produce x for 4-state or 0 for 2-state.
     Bit-select results are unsigned, regardless of the operands.
-    Part-select results are unsigned, regardless of the operands even if 
+    Part-select results are unsigned, regardless of the operands even if
     the part-select specifies the entire vector.
     See IEEE 1800-2017 § 11.8.1 "Rules for expression types"
 
@@ -1862,7 +1862,7 @@ def DeferAssertAttr : I32EnumAttr<
   let cppNamespace = "circt::moore";
 }
 
-class ImmediateAssertOp<string mnemonic, list<Trait> traits = []> : 
+class ImmediateAssertOp<string mnemonic, list<Trait> traits = []> :
     MooreOp<mnemonic, traits # [HasParent<"ProcedureOp">]>{
   let arguments = (ins
     DeferAssertAttr:$defer,
@@ -2287,7 +2287,7 @@ def SeverityBIOp : Builtin<"severity"> {
 // Math Builtins
 //===----------------------------------------------------------------------===//
 
-class RealMathFunc<string mnemonic, list<Trait> traits = []> : 
+class RealMathFunc<string mnemonic, list<Trait> traits = []> :
     Builtin<mnemonic, traits # [SameOperandsAndResultType]> {
   let description = [{
     The system real math functions shall accept real value arguments and return

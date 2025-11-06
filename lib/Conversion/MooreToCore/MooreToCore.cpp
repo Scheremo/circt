@@ -45,6 +45,7 @@ using namespace moore;
 
 using comb::ICmpPredicate;
 using llvm::SmallDenseSet;
+using llvm::StringMap;
 
 namespace {
 
@@ -52,23 +53,51 @@ namespace {
 struct ClassTypeCache {
   struct ClassStructInfo {
     LLVM::LLVMStructType classBody;
+    LLVM::LLVMStructType vTable;
 
     // field name -> GEP path inside ident (excluding the leading pointer index)
-    DenseMap<StringRef, SmallVector<unsigned, 2>> propertyPath;
+    StringMap<SmallVector<unsigned, 2>> propertyPath;
+    // class name, field name -> GEP path inside vTable
+    StringMap<StringMap<SmallVector<unsigned, 2>>> virtualMethodPath;
 
-    // TODO: Add classVTable in here.
     /// Record/overwrite the field path to a single property for a class.
-    void setFieldPath(StringRef propertyName, ArrayRef<unsigned> path) {
+    void setDataFieldPath(StringRef propertyName, ArrayRef<unsigned> path) {
       this->propertyPath[propertyName] =
           SmallVector<unsigned, 2>(path.begin(), path.end());
     }
 
     /// Lookup the full GEP path for a (class, field).
     std::optional<ArrayRef<unsigned>>
-    getFieldPath(StringRef propertySym) const {
+    getDataFieldPath(StringRef propertySym) const {
       if (auto prop = this->propertyPath.find(propertySym);
           prop != this->propertyPath.end())
         return ArrayRef<unsigned>(prop->second);
+      return std::nullopt;
+    }
+
+    /// Record/overwrite the method path to a single method for a class.
+    void setVTablePath(StringRef className, StringRef methodName,
+                       ArrayRef<unsigned> path) {
+      this->virtualMethodPath[className][methodName] =
+          SmallVector<unsigned, 2>(path.begin(), path.end());
+    }
+
+    /// Lookup a partial GEP path for a class.
+    bool getVTableClassPathRegistered(StringRef classSym) const {
+      if (auto prop = this->virtualMethodPath.find(classSym);
+          prop != this->virtualMethodPath.end())
+        return true;
+      return false;
+    }
+
+    /// Lookup the full GEP path for a (class, method).
+    std::optional<ArrayRef<unsigned>>
+    getVTablePath(StringRef classSym, StringRef propertySym) const {
+      if (auto prop = this->virtualMethodPath.find(classSym);
+          prop != this->virtualMethodPath.end())
+        if (auto path = prop->second.find(propertySym);
+            path != prop->second.end())
+          return ArrayRef<unsigned>(path->second);
       return std::nullopt;
     }
   };
@@ -129,16 +158,18 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
     // We already have a resolved class struct body.
     return success();
 
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  auto *context = op->getContext();
+
   // Otherwise we need to resolve.
   ClassTypeCache::ClassStructInfo structBody;
   SmallVector<Type> structBodyMembers;
+  SmallVector<Type> structVTableMembers;
 
   // Base-first (prefix) layout for single inheritance.
-  unsigned derivedStartIdx = 0;
-
+  unsigned derivedPropertyStartIdx = 0;
+  unsigned derivedVTableStartIdx = 0;
   if (auto baseClass = op.getBaseAttr()) {
-
-    ModuleOp mod = op->getParentOfType<ModuleOp>();
     auto *opSym = mod.lookupSymbol(baseClass);
     auto classDeclOp = cast<ClassDeclOp>(opSym);
 
@@ -148,19 +179,65 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
     // Process base class' struct layout first
     auto baseClassStruct = cache.getStructInfo(baseClass);
     structBodyMembers.push_back(baseClassStruct->classBody);
-    derivedStartIdx = 1;
+    structVTableMembers.push_back(baseClassStruct->vTable);
+    derivedPropertyStartIdx = 1;
+    derivedVTableStartIdx = 1;
 
     // Inherit base field paths with a leading 0.
     for (auto &kv : baseClassStruct->propertyPath) {
       SmallVector<unsigned, 2> path;
       path.push_back(0); // into base subobject
-      path.append(kv.second.begin(), kv.second.end());
-      structBody.setFieldPath(kv.first, path);
+      path.append(kv.getValue().begin(), kv.getValue().end());
+      structBody.setDataFieldPath(kv.getKey(), path);
+    }
+
+    // Inherit base vtable paths with a leading 0.
+    for (auto &classEntry : baseClassStruct->virtualMethodPath) {
+      auto &methods = classEntry.getValue();
+
+      for (auto &kv : methods) {
+        llvm::SmallVector<unsigned, 2> path;
+        path.push_back(0);
+        path.append(kv.second.begin(), kv.second.end());
+        structBody.setVTablePath(classEntry.getKey(), kv.getKey(), path);
+      }
+    }
+  }
+
+  // Process interface class inheritance left-to-right
+  if (op.getImplementedInterfaces().has_value()) {
+    for (auto maybeInterfaceClass : op.getImplementedInterfacesAttr()) {
+      auto interfaceClass = cast<SymbolRefAttr>(maybeInterfaceClass);
+      auto *opSym = mod.lookupSymbol(interfaceClass);
+      auto classDeclOp = cast<ClassDeclOp>(opSym);
+
+      // If this interface has already been registered by base, skip ahead
+      if (structBody.getVTableClassPathRegistered(classDeclOp.getSymName()))
+        continue;
+
+      if (failed(resolveClassStructBody(classDeclOp, typeConverter, cache)))
+        return failure();
+
+      auto interfaceClassStruct = cache.getStructInfo(interfaceClass);
+      structVTableMembers.push_back(interfaceClassStruct->vTable);
+      derivedVTableStartIdx++;
+
+      // Inherit interface vtable paths with a leading 0.
+      for (auto &classEntry : interfaceClassStruct->virtualMethodPath) {
+        auto &methods = classEntry.getValue();
+
+        for (auto &kv : methods) {
+          llvm::SmallVector<unsigned, 2> path;
+          path.push_back(0);
+          path.append(kv.second.begin(), kv.second.end());
+          structBody.setVTablePath(classEntry.getKey(), kv.getKey(), path);
+        }
+      }
     }
   }
 
   // Properties in source order.
-  unsigned iterator = derivedStartIdx;
+  unsigned propertyIterator = derivedPropertyStartIdx;
   auto &block = op.getBody().front();
   for (Operation &child : block) {
     if (auto prop = dyn_cast<ClassPropertyDeclOp>(child)) {
@@ -173,20 +250,58 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
       structBodyMembers.push_back(llvmTy);
 
       // Derived field path: either {i} or {1+i} if base is present.
-      SmallVector<unsigned, 2> path{iterator};
-      structBody.setFieldPath(prop.getSymName(), path);
-      ++iterator;
+      SmallVector<unsigned, 2> path{propertyIterator};
+      structBody.setDataFieldPath(prop.getSymName(), path);
+      ++propertyIterator;
     }
   }
 
-  // TODO: Handle vtable generation over ClassMethodDeclOp here.
-  auto llvmStructTy = getOrCreateOpaqueStruct(op.getContext(), classSym);
+  // Virtual methods in source order.
+  unsigned methodIterator = derivedVTableStartIdx;
+  for (Operation &child : block) {
+    if (auto methodDecl = dyn_cast<ClassMethodDeclOp>(child)) {
+      // Only add virtual methods to vTable
+      if (!methodDecl.getIsVirtual())
+        continue;
+
+      if (!methodDecl.getImpl().has_value()) {
+        structVTableMembers.push_back({});
+      } else {
+        // Construct qualified name of virtual method of this class
+        methodDecl.getImpl().value().dump();
+        auto *fnSymbol = mod.lookupSymbol(methodDecl.getImpl().value());
+        if (fnSymbol)
+          fnSymbol->dump();
+      }
+      // structVTableMembers.push_back(functionDecl);
+      //  Derived field path: either {i} or {1+i} if base is present.
+      SmallVector<unsigned, 2> path{methodIterator};
+      structBody.setVTablePath(op.getSymName(), methodDecl.getSymName(), path);
+      ++methodIterator;
+    }
+  }
+
+  auto dataStructName =
+      FlatSymbolRefAttr::get(context, (classSym.getValue() + ":::data").str());
+  auto vTableStructName = FlatSymbolRefAttr::get(
+      context, (classSym.getValue() + ":::vtable").str());
+
+  // Register data struct
+  auto llvmStructTy = getOrCreateOpaqueStruct(context, dataStructName);
   // Empty structs may be kept opaque
   if (!structBodyMembers.empty() &&
       failed(llvmStructTy.setBody(structBodyMembers, false)))
     return op.emitOpError() << "Failed to set LLVM Struct body";
-
   structBody.classBody = llvmStructTy;
+
+  // Register vTable
+  auto llvmVTableTy = getOrCreateOpaqueStruct(context, vTableStructName);
+  // Empty structs may be kept opaque
+  if (!structVTableMembers.empty() && !llvm::all_of(structVTableMembers, [](auto p) {return p == nullptr; }) &&
+      failed(llvmVTableTy.setBody(structVTableMembers, false)))
+    return op.emitOpError() << "Failed to set LLVM Struct vTable";
+  structBody.vTable = llvmVTableTy;
+
   cache.setClassInfo(classSym, structBody);
 
   return success();
@@ -740,7 +855,7 @@ struct ClassPropertyRefOpConversion
 
     // Look up cached GEP path for the property.
     auto propSym = op.getProperty();
-    auto pathOpt = structInfo->getFieldPath(propSym);
+    auto pathOpt = structInfo->getDataFieldPath(propSym);
     if (!pathOpt)
       return rewriter.notifyMatchFailure(op,
                                          "no GEP path for property " + propSym);

@@ -106,7 +106,7 @@ moore.class.classdecl @F extends @C {
 // CHECK-LABEL: func.func private @test_new6
 // CHECK-SAME: (%arg0: !llvm.ptr) -> !llhd.ref<i32> {
 // CHECK:   [[CONSTIDX:%.+]] = llvm.mlir.constant(1 : i32) : i32
-// CHECK:   [[GEP:%.+]] = llvm.getelementptr %arg0[[[CONSTIDX]]] : (!llvm.ptr, i32) -> !llvm.ptr, !llvm.struct<"G", (struct<"C", (i32, i32, i32)>, i32, i32, i32)>
+// CHECK:   [[GEP:%.+]] = llvm.getelementptr %arg0[[[CONSTIDX]]] : (!llvm.ptr, i32) -> !llvm.ptr, !llvm.struct<"G::data", (struct<"C::data", (i32, i32, i32)>, i32, i32, i32)>
 // CHECK:   [[CONV:%.+]] = builtin.unrealized_conversion_cast [[GEP]] : !llvm.ptr to !llhd.ref<i32>
 // CHECK:   return [[CONV]] : !llhd.ref<i32>
 
