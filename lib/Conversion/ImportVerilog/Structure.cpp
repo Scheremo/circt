@@ -1610,7 +1610,18 @@ struct ClassDeclVisitor {
     // Grab the finalized function type from the lowered func.op.
     FunctionType fnTy = lowering->op.getFunctionType();
     // Emit the method decl into the class body, preserving source order.
-    moore::ClassMethodDeclOp::create(builder, loc, fn.name, fnTy);
+    auto method = moore::ClassMethodDeclOp::create(builder, loc, fn.name, fnTy);
+
+    auto classSym = classLowering.op.getSymNameAttr();
+    auto methodSym = method.getSymNameAttr();
+    auto nestedMethodRef = mlir::SymbolRefAttr::get(
+        classSym, {mlir::FlatSymbolRefAttr::get(methodSym)});
+    auto implRef = mlir::FlatSymbolRefAttr::get(lowering->op);
+
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(classLowering.op);
+
+    moore::ClassMethodBindingOp::create(builder, loc, nestedMethodRef, implRef);
 
     return success();
   }

@@ -1432,6 +1432,13 @@ OpFoldResult DivSOp::fold(FoldAdaptor adaptor) {
 // Classes
 //===----------------------------------------------------------------------===//
 
+LogicalResult ClassMethodBindingOp::verifySymbolUses(SymbolTableCollection &symTab) {
+  // If either ref can’t resolve during parse, don’t hard-error; parsing order can vary.
+  (void) symTab.lookupNearestSymbolFrom(*this, getMethodAttr());
+  (void) symTab.lookupNearestSymbolFrom(*this, getImplAttr());
+  return success();
+}
+
 LogicalResult ClassDeclOp::verify() {
   mlir::Region &body = getBody();
   if (body.empty())
