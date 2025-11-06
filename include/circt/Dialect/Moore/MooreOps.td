@@ -2426,6 +2426,20 @@ def ClassMethodDeclOp
   }];
 }
 
+def ClassMethodBindingOp
+  : MooreOp<"class.method_binding",
+  [DeclareOpInterfaceMethods<SymbolUserOpInterface>, NoTerminator]> {
+  let summary = "Link a class method symbol to its top-level implementation";
+  let arguments = (ins
+    SymbolRefAttr:$method,
+    FlatSymbolRefAttr:$impl
+  );
+  let results = (outs);
+  let assemblyFormat = [{
+    $method `->` $impl attr-dict
+  }];
+}
+
 def ClassDeclOp
     : MooreOp<"class.classdecl", [Symbol, SymbolTable, IsolatedFromAbove,
     NoTerminator, SingleBlock]> {
