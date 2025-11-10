@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/MooreToCore.h"
+#include "circt/Conversion/ConvertToLLVM.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -32,7 +33,10 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include <mlir/Conversion/LLVMCommon/TypeConverter.h>
+#include <mlir/Pass/PassManager.h>
 
 namespace circt {
 #define GEN_PASS_DEF_CONVERTMOORETOCORE
@@ -51,14 +55,197 @@ namespace {
 
 /// Cache for identified structs and field GEP paths keyed by class symbol.
 struct ClassTypeCache {
-  struct ClassStructInfo {
-    LLVM::LLVMStructType classBody;
-    LLVM::LLVMStructType vTable;
+  struct VTableNode {
+    struct Slot {
+      mlir::StringAttr name;             // key (method or subtable name)
+      mlir::FlatSymbolRefAttr impl;      // set iff leaf
+      std::unique_ptr<VTableNode> child; // set iff child
 
+      bool isLeaf() const { return impl && !child; }
+      bool isChild() const { return (bool)child; }
+    };
+
+    // Stable emission order for the vtable:
+    llvm::SmallVector<Slot, 16> slots;
+    // O(1) lookup for updates/overwrites:
+    llvm::DenseMap<mlir::StringAttr, unsigned> indexOf;
+
+    VTableNode() = default;
+    VTableNode(const VTableNode &other) { copyFrom(other); }
+    VTableNode &operator=(const VTableNode &other) {
+      if (this != &other) {
+        clear();
+        copyFrom(other);
+      }
+      return *this;
+    }
+
+    VTableNode(VTableNode &&) noexcept = default;
+    VTableNode &operator=(VTableNode &&) noexcept = default;
+    ~VTableNode() { clear(); }
+
+    // Insert or overwrite a LEAF slot; returns stable index.
+    unsigned upsertLeaf(mlir::StringAttr name,
+                        mlir::FlatSymbolRefAttr implRef) {
+      if (auto it = indexOf.find(name); it != indexOf.end()) {
+        Slot &s = slots[it->second];
+        s.impl = implRef;
+        s.child.reset();
+        return it->second;
+      }
+      unsigned idx = slots.size();
+      Slot s;
+      s.name = name;
+      s.impl = implRef;
+      slots.push_back(std::move(s));
+      indexOf.try_emplace(name, idx);
+      return idx;
+    }
+
+    /// Update a leaf by name, if it exists. Never changes slot index or
+    /// childness. Returns the stable slot index if updated; std::nullopt if not
+    /// found.
+    std::optional<unsigned> updateLeaf(StringAttr name,
+                                       FlatSymbolRefAttr newImpl) {
+      auto it = indexOf.find(name);
+      if (it == indexOf.end())
+        return std::nullopt;
+      Slot &s = slots[it->second];
+      // Only update the impl; do NOT create/clear child here.
+      s.impl = newImpl;
+      return it->second;
+    }
+
+    /// Add (or replace) a child subtable named `name` with a **copy** of `src`.
+    /// Returns (child*, index). If `src` is null, returns {nullptr, ~0u}.
+    std::pair<VTableNode *, unsigned>
+    addOrReplaceChildCopy(mlir::StringAttr name,
+                          const std::unique_ptr<VTableNode> &src) {
+      if (!src)
+        return {nullptr, ~0u};
+
+      if (auto it = indexOf.find(name); it != indexOf.end()) {
+        Slot &s = slots[it->second];
+        if (!s.child) {
+          s.child =
+              std::make_unique<VTableNode>(*src); // deep-copy via copy-ctor
+        } else {
+          *s.child = *src; // deep-copy via copy-assign
+        }
+        return {s.child.get(), it->second};
+      }
+
+      unsigned idx = slots.size();
+      Slot s;
+      s.name = name;
+      s.child = std::make_unique<VTableNode>(*src); // deep-copy
+      slots.push_back(std::move(s));
+      indexOf.try_emplace(name, idx);
+      return {slots[idx].child.get(), idx};
+    }
+
+  private:
+    void clear() {
+      // unique_ptr children will auto-destroy; map/vector clean themselves.
+      slots.clear();
+      indexOf.clear();
+    }
+    void copyFrom(const VTableNode &other) {
+      slots.reserve(other.slots.size());
+      // Rebuild slots (deep copy children) and index map deterministically.
+      for (const Slot &os : other.slots) {
+        Slot ns;
+        ns.name = os.name;
+        ns.impl = os.impl;
+        if (os.child)
+          ns.child = std::make_unique<VTableNode>(*os.child); // deep copy
+        unsigned idx = slots.size();
+        slots.push_back(std::move(ns));
+        indexOf.try_emplace(slots.back().name, idx);
+      }
+    }
+  };
+
+  struct ClassStructInfo {
+    StringAttr classSym;
+    LLVM::LLVMStructType classBody;
+    // Root vtable node for this class:
+    std::unique_ptr<VTableNode> vtableRoot;
     // field name -> GEP path inside ident (excluding the leading pointer index)
     StringMap<SmallVector<unsigned, 2>> propertyPath;
     // class name, field name -> GEP path inside vTable
     StringMap<StringMap<SmallVector<unsigned, 2>>> virtualMethodPath;
+
+    ClassStructInfo(StringAttr classSym)
+        : classSym(classSym), vtableRoot(std::make_unique<VTableNode>()) {};
+    ~ClassStructInfo() = default;
+    // Deep-copy constructor
+    ClassStructInfo(const ClassStructInfo &o)
+        : classSym(o.classSym), classBody(o.classBody),
+          vtableRoot(o.vtableRoot ? std::make_unique<VTableNode>(
+                                        *o.vtableRoot) // deep copy
+                                  : nullptr),
+          propertyPath(o.propertyPath), virtualMethodPath(o.virtualMethodPath) {
+    }
+    // Deep-copy assignment
+    ClassStructInfo &operator=(const ClassStructInfo &o) {
+      if (this != &o) {
+        classSym = o.classSym;
+        classBody = o.classBody;
+        propertyPath = o.propertyPath;
+        virtualMethodPath = o.virtualMethodPath;
+        vtableRoot = o.vtableRoot ? std::make_unique<VTableNode>(*o.vtableRoot)
+                                  : nullptr;
+      }
+      return *this;
+    }
+    // Moves can be defaulted (unique_ptr moves fine)
+    ClassStructInfo(ClassStructInfo &&) noexcept = default;
+    ClassStructInfo &operator=(ClassStructInfo &&) noexcept = default;
+
+    /// Copy `src.vtableRoot` into child slot `subIdx` under our root.
+    /// Also copy src.virtualMethodPath into ours, prefixing each path with
+    /// `subIdx`. Returns the child pointer (nullptr if src has no vtableRoot).
+    bool addSubtableCopy(const ClassStructInfo &src, unsigned subIdx) {
+      if (!src.vtableRoot)
+        return false;
+      VTableNode *root = vtableRoot.get();
+      // Ensure slot exists at subIdx, then replace its child with a deep copy.
+      if (root->slots.size() <= subIdx)
+        root->slots.resize(subIdx + 1);
+
+      VTableNode::Slot &slot = root->slots[subIdx];
+      slot.name = src.classSym;
+      slot.child = std::make_unique<VTableNode>(*src.vtableRoot); // deep copy
+      // Keep name→index map consistent if you rely on it.
+      root->indexOf[slot.name] = subIdx;
+
+      // Copy/overwrite virtualMethodPath entries with prefixed index.
+      for (const auto &outerKV : src.virtualMethodPath) {
+        llvm::StringRef outerKey = outerKV.getKey(); // class or subtable key
+        const auto &innerMap = outerKV.getValue();   // method -> path
+        for (const auto &innerKV : innerMap) {
+          llvm::StringRef methodKey = innerKV.getKey();
+          const auto &srcPath = innerKV.getValue(); // SmallVector<unsigned,2>
+
+          auto &dstPath = virtualMethodPath[outerKey][methodKey];
+          dstPath.clear();
+          dstPath.push_back(subIdx);
+          dstPath.append(srcPath.begin(), srcPath.end());
+        }
+      }
+      return true;
+    }
+    // Upsert a method in the classSym table and update in subtables.
+    void upsertMethod(mlir::StringAttr methodName,
+                      mlir::FlatSymbolRefAttr impl) {
+      auto *root = vtableRoot.get();
+      unsigned idx = root->upsertLeaf(methodName, impl);
+      auto &path = virtualMethodPath[classSym][methodName.getValue()];
+      path.clear();
+      path.push_back(idx);
+      rebindMethodIfPresent(methodName, impl);
+    }
 
     /// Record/overwrite the field path to a single property for a class.
     void setDataFieldPath(StringRef propertyName, ArrayRef<unsigned> path) {
@@ -75,53 +262,209 @@ struct ClassTypeCache {
       return std::nullopt;
     }
 
-    /// Record/overwrite the method path to a single method for a class.
-    void setVTablePath(StringRef className, StringRef methodName,
-                       ArrayRef<unsigned> path) {
-      this->virtualMethodPath[className][methodName] =
-          SmallVector<unsigned, 2>(path.begin(), path.end());
+  private:
+    void rebindMethodIfPresent(mlir::StringAttr methodName,
+                               mlir::FlatSymbolRefAttr impl) {
+      llvm::SmallVector<unsigned, 4> prefix;
+      rebindDFS(vtableRoot.get(), methodName, impl, prefix,
+                classSym.getValue());
     }
 
-    /// Lookup a partial GEP path for a class.
-    bool getVTableClassPathRegistered(StringRef classSym) const {
-      if (auto prop = this->virtualMethodPath.find(classSym);
-          prop != this->virtualMethodPath.end())
-        return true;
-      return false;
-    }
+    void rebindDFS(VTableNode *node, mlir::StringAttr methodName,
+                   mlir::FlatSymbolRefAttr impl,
+                   llvm::SmallVectorImpl<unsigned> &prefix,
+                   llvm::StringRef outerKey) {
+      // Try to update a leaf in this node
+      node->updateLeaf(methodName, impl);
 
-    /// Lookup the full GEP path for a (class, method).
-    std::optional<ArrayRef<unsigned>>
-    getVTablePath(StringRef classSym, StringRef propertySym) const {
-      if (auto prop = this->virtualMethodPath.find(classSym);
-          prop != this->virtualMethodPath.end())
-        if (auto path = prop->second.find(propertySym);
-            path != prop->second.end())
-          return ArrayRef<unsigned>(path->second);
-      return std::nullopt;
+      // Recurse into children (subtables)
+      for (unsigned i = 0, e = node->slots.size(); i < e; ++i) {
+        auto &s = node->slots[i];
+        if (!s.isChild())
+          continue;
+        prefix.push_back(i);
+        llvm::StringRef childKey = s.name.getValue();
+        rebindDFS(s.child.get(), methodName, impl, prefix, childKey);
+        prefix.pop_back();
+      }
     }
   };
 
   /// Record the identified struct body for a class.
   /// Implicitly finalizes the class to struct conversion.
-  void setClassInfo(SymbolRefAttr classSym, const ClassStructInfo &info) {
+  void setClassInfo(SymbolRefAttr classSym,
+                    std::unique_ptr<ClassStructInfo> info) {
     auto &dst = classToStructMap[classSym];
-    dst = info;
+    dst = std::move(info);
   }
 
   /// Lookup the identified struct body for a class.
-  std::optional<ClassStructInfo> getStructInfo(SymbolRefAttr classSym) const {
+  const ClassStructInfo *getStructInfo(SymbolRefAttr classSym) const {
     if (auto it = classToStructMap.find(classSym); it != classToStructMap.end())
-      return it->second;
-    return std::nullopt;
+      return it->second.get();
+    return nullptr;
   }
 
 private:
   // Keyed by the SymbolRefAttr of the class.
   // Kept private so all accesses are done with helpers which preserve
   // invariants
-  DenseMap<Attribute, ClassStructInfo> classToStructMap;
+  DenseMap<Attribute, std::unique_ptr<ClassStructInfo>> classToStructMap;
 };
+
+struct VField {
+  // Leaf = function pointer, Nested = inlined aggregate
+  enum Kind { LeafPtr, NestedAgg } kind;
+  mlir::FlatSymbolRefAttr sym;         // for LeafPtr
+  mlir::LLVM::LLVMStructType nestedTy; // for NestedAgg
+  // nestedVal is filled later inside the initializer
+};
+
+// Collect types/structure; skip empty children entirely.
+static void collectVTableLayout(const ClassTypeCache::VTableNode *node,
+                                mlir::MLIRContext *ctx,
+                                llvm::SmallVector<mlir::Type> &fieldTys,
+                                llvm::SmallVector<VField> &fields) {
+  using namespace mlir;
+  using namespace mlir::LLVM;
+
+  auto ptrTy = LLVMPointerType::get(ctx);
+
+  for (const auto &slot : node->slots) {
+    if (slot.isLeaf()) {
+      fieldTys.push_back(ptrTy);
+      fields.push_back(VField{VField::LeafPtr, slot.impl, {}});
+      continue;
+    }
+    if (slot.isChild()) {
+      // Recurse on child first.
+      SmallVector<Type> subFieldTys;
+      SmallVector<VField> subFields;
+      collectVTableLayout(slot.child.get(), ctx, subFieldTys, subFields);
+      if (subFieldTys.empty()) {
+        // Empty child → skip entirely (prevents struct<()>).
+        continue;
+      }
+      auto subTy = LLVMStructType::getLiteral(ctx, subFieldTys);
+      fieldTys.push_back(subTy);
+      fields.push_back(VField{VField::NestedAgg, {}, subTy});
+      // We’ll re-run collection for the nested initializer in-place later.
+      // (We don’t store nested fields here; we build them when emitting.)
+      continue;
+    }
+    // Explicit “empty slot” → keep index stable with a ptr(null).
+    fieldTys.push_back(ptrTy);
+    fields.push_back(VField{VField::LeafPtr, FlatSymbolRefAttr{}, {}});
+  }
+}
+
+static mlir::LLVM::LLVMFuncOp ensureForwardDecl(mlir::OpBuilder &b,
+                                                mlir::FlatSymbolRefAttr sym) {
+  using namespace mlir;
+  using namespace mlir::LLVM;
+
+  Operation *symTable =
+      SymbolTable::getNearestSymbolTable(b.getInsertionBlock()->getParentOp());
+  auto module = dyn_cast<ModuleOp>(symTable);
+  assert(module && "expected ModuleOp");
+
+  if (auto fn = SymbolTable::lookupNearestSymbolFrom<LLVMFuncOp>(module, sym))
+    return fn;
+
+  MLIRContext *ctx = b.getContext();
+  auto voidFnTy = LLVMFunctionType::get(LLVMVoidType::get(ctx), {}, false);
+
+  OpBuilder::InsertionGuard g(b);
+  b.setInsertionPointToStart(module.getBody());
+  auto name = (sym.getValue() + "__llvm").str();
+  auto decl = LLVMFuncOp::create(b, module.getLoc(), name, voidFnTy);
+  decl.setLinkage(Linkage::External);
+  return decl;
+}
+
+static mlir::LLVM::GlobalOp
+buildVTableGlobal(mlir::OpBuilder &b, mlir::Location loc,
+                  llvm::StringRef globalName,
+                  const ClassTypeCache::VTableNode *root) {
+  using namespace mlir;
+  using namespace mlir::LLVM;
+
+  MLIRContext *ctx = b.getContext();
+
+  // 1) Compute a flattened aggregate type & field descriptors (no empty
+  // children).
+  SmallVector<Type> fieldTys;
+  SmallVector<VField> fields;
+  collectVTableLayout(root, ctx, fieldTys, fields);
+
+  auto aggTy = LLVMStructType::getLiteral(ctx, fieldTys);
+
+  // 2) Create the global (constant, internal by default).
+  auto glob = GlobalOp::create(b, loc, /*type=*/aggTy,
+                               /*isConstant=*/true, Linkage::Internal,
+                               /*name=*/globalName, /*value=*/Attribute());
+
+  // 3) Fill the initializer region: undef + insertvalue per field.
+  {
+    Region &r = glob.getInitializerRegion();
+    auto *block = new Block();
+    r.push_back(block);
+    OpBuilder ib(block, block->begin());
+
+    Value cur = UndefOp::create(ib, loc, aggTy);
+
+    // We may need to recursively materialize nested aggregates inline.
+    std::function<Value(const VField &)> makeFieldVal =
+        [&](const VField &F) -> Value {
+      auto ptrTy = LLVMPointerType::get(ctx);
+      if (F.kind == VField::LeafPtr) {
+        if (F.sym) {
+          auto fn = ensureForwardDecl(ib, F.sym);
+          return AddressOfOp::create(ib, loc, ptrTy, fn.getSymName());
+        }
+        // explicit empty → null ptr to keep indices stable
+        return LLVM::ConstantOp::create(ib, loc, ptrTy, 0);
+      }
+      // Nested aggregate: rebuild inline by re-running collection on the child.
+      // We don’t have child nodes here, so the design is:
+      // - During collection, for NestedAgg we preserved F.nestedTy.
+      // - We must now build an undef of that type and fill its subfields
+      //   by recursing on the original child node. Easiest: call a small
+      //   helper that re-walks the child and returns a Value of F.nestedTy.
+      // Since we don’t have the child pointer in VField, we re-collect on the
+      // fly. To keep this self-contained, we assume NestedAgg only occurs when
+      // slots.size()>0 and re-run collect/materialize directly from
+      // node->child. If you have that pointer handy, thread it through VField.
+      (void)F; // In practice, carry child pointer in VField to avoid re-walks.
+      llvm_unreachable(
+          "Thread child pointer into VField to materialize nested");
+    };
+
+    // Emit each field.
+    for (unsigned i = 0, e = fields.size(); i < e; ++i) {
+      Value val;
+      if (fields[i].kind == VField::NestedAgg) {
+        // —— Minimal, non-duplicating approach ——
+        // Re-run layout & emit nested inline using a tiny local lambda that
+        // calls collectVTableLayout and does an inner undef+insertvalue.
+        // You likely already have node pointers → pass them through VField
+        // to avoid re-walking. For this sketch, we treat nested as not present
+        // in your simple example and assert(false) otherwise.
+        llvm_unreachable("plumb child node to materialize nested aggregate");
+      } else {
+        val = makeFieldVal(fields[i]);
+      }
+
+      cur = InsertValueOp::create(
+          ib, loc, aggTy, cur, val,
+          ib.getDenseI64ArrayAttr({static_cast<int64_t>(i)}));
+    }
+
+    LLVM::ReturnOp::create(ib, loc, cur);
+  }
+
+  return glob;
+}
 
 /// Ensure we have `declare i8* @malloc(i64)` (opaque ptr prints as !llvm.ptr).
 static LLVM::LLVMFuncOp getOrCreateMalloc(ModuleOp mod, OpBuilder &b) {
@@ -162,9 +505,9 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
   auto *context = op->getContext();
 
   // Otherwise we need to resolve.
-  ClassTypeCache::ClassStructInfo structBody;
+  std::unique_ptr<ClassTypeCache::ClassStructInfo> structBody =
+      std::make_unique<ClassTypeCache::ClassStructInfo>(classSym.getAttr());
   SmallVector<Type> structBodyMembers;
-  SmallVector<Type> structVTableMembers;
 
   // Base-first (prefix) layout for single inheritance.
   unsigned derivedPropertyStartIdx = 0;
@@ -177,31 +520,18 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
       return failure();
 
     // Process base class' struct layout first
-    auto baseClassStruct = cache.getStructInfo(baseClass);
+    const auto *baseClassStruct = cache.getStructInfo(baseClass);
     structBodyMembers.push_back(baseClassStruct->classBody);
-    structVTableMembers.push_back(baseClassStruct->vTable);
-    derivedPropertyStartIdx = 1;
-    derivedVTableStartIdx = 1;
 
     // Inherit base field paths with a leading 0.
     for (auto &kv : baseClassStruct->propertyPath) {
       SmallVector<unsigned, 2> path;
-      path.push_back(0); // into base subobject
+      path.push_back(derivedPropertyStartIdx++); // into base subobject
       path.append(kv.getValue().begin(), kv.getValue().end());
-      structBody.setDataFieldPath(kv.getKey(), path);
+      structBody->setDataFieldPath(kv.getKey(), path);
     }
-
-    // Inherit base vtable paths with a leading 0.
-    for (auto &classEntry : baseClassStruct->virtualMethodPath) {
-      auto &methods = classEntry.getValue();
-
-      for (auto &kv : methods) {
-        llvm::SmallVector<unsigned, 2> path;
-        path.push_back(0);
-        path.append(kv.second.begin(), kv.second.end());
-        structBody.setVTablePath(classEntry.getKey(), kv.getKey(), path);
-      }
-    }
+    // Inherit vtable
+    structBody->addSubtableCopy(*baseClassStruct, derivedVTableStartIdx++);
   }
 
   // Process interface class inheritance left-to-right
@@ -211,28 +541,13 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
       auto *opSym = mod.lookupSymbol(interfaceClass);
       auto classDeclOp = cast<ClassDeclOp>(opSym);
 
-      // If this interface has already been registered by base, skip ahead
-      if (structBody.getVTableClassPathRegistered(classDeclOp.getSymName()))
-        continue;
-
       if (failed(resolveClassStructBody(classDeclOp, typeConverter, cache)))
         return failure();
 
-      auto interfaceClassStruct = cache.getStructInfo(interfaceClass);
-      structVTableMembers.push_back(interfaceClassStruct->vTable);
-      derivedVTableStartIdx++;
-
-      // Inherit interface vtable paths with a leading 0.
-      for (auto &classEntry : interfaceClassStruct->virtualMethodPath) {
-        auto &methods = classEntry.getValue();
-
-        for (auto &kv : methods) {
-          llvm::SmallVector<unsigned, 2> path;
-          path.push_back(0);
-          path.append(kv.second.begin(), kv.second.end());
-          structBody.setVTablePath(classEntry.getKey(), kv.getKey(), path);
-        }
-      }
+      const auto *interfaceClassStruct = cache.getStructInfo(interfaceClass);
+      // Inherit vtable
+      structBody->addSubtableCopy(*interfaceClassStruct,
+                                  derivedVTableStartIdx++);
     }
   }
 
@@ -250,60 +565,32 @@ static LogicalResult resolveClassStructBody(ClassDeclOp op,
       structBodyMembers.push_back(llvmTy);
 
       // Derived field path: either {i} or {1+i} if base is present.
-      SmallVector<unsigned, 2> path{propertyIterator};
-      structBody.setDataFieldPath(prop.getSymName(), path);
-      ++propertyIterator;
+      SmallVector<unsigned, 2> path{propertyIterator++};
+      structBody->setDataFieldPath(prop.getSymName(), path);
     }
-  }
-
-  // Virtual methods in source order.
-  unsigned methodIterator = derivedVTableStartIdx;
-  for (Operation &child : block) {
     if (auto methodDecl = dyn_cast<ClassMethodDeclOp>(child)) {
-      // Only add virtual methods to vTable
-      if (!methodDecl.getIsVirtual())
-        continue;
 
-      if (!methodDecl.getImpl().has_value()) {
-        structVTableMembers.push_back({});
-      } else {
-        // Construct qualified name of virtual method of this class
-        methodDecl.getImpl().value().dump();
-        auto *fnSymbol = mod.lookupSymbol(methodDecl.getImpl().value());
-        if (fnSymbol)
-          fnSymbol->dump();
-      }
-      // structVTableMembers.push_back(functionDecl);
-      //  Derived field path: either {i} or {1+i} if base is present.
-      SmallVector<unsigned, 2> path{methodIterator};
-      structBody.setVTablePath(op.getSymName(), methodDecl.getSymName(), path);
-      ++methodIterator;
+      auto classSym = op.getSymNameAttr();
+      auto methodSym = methodDecl.getSymNameAttr();
+      auto methodRef = classSym.str() + "::" + methodSym.str();
+
+      auto *funcImpl = mod.lookupSymbol(methodRef);
+      if (!funcImpl)
+        continue;
+      auto func = cast<func::FuncOp>(*funcImpl);
+      structBody->upsertMethod(methodSym, FlatSymbolRefAttr::get(func));
     }
   }
-
-  auto dataStructName =
-      FlatSymbolRefAttr::get(context, (classSym.getValue() + ":::data").str());
-  auto vTableStructName = FlatSymbolRefAttr::get(
-      context, (classSym.getValue() + ":::vtable").str());
 
   // Register data struct
-  auto llvmStructTy = getOrCreateOpaqueStruct(context, dataStructName);
+  auto llvmStructTy = getOrCreateOpaqueStruct(context, classSym);
   // Empty structs may be kept opaque
   if (!structBodyMembers.empty() &&
       failed(llvmStructTy.setBody(structBodyMembers, false)))
     return op.emitOpError() << "Failed to set LLVM Struct body";
-  structBody.classBody = llvmStructTy;
+  structBody->classBody = llvmStructTy;
 
-  // Register vTable
-  auto llvmVTableTy = getOrCreateOpaqueStruct(context, vTableStructName);
-  // Empty structs may be kept opaque
-  if (!structVTableMembers.empty() && !llvm::all_of(structVTableMembers, [](auto p) {return p == nullptr; }) &&
-      failed(llvmVTableTy.setBody(structVTableMembers, false)))
-    return op.emitOpError() << "Failed to set LLVM Struct vTable";
-  structBody.vTable = llvmVTableTy;
-
-  cache.setClassInfo(classSym, structBody);
-
+  cache.setClassInfo(classSym, std::move(structBody));
   return success();
 }
 
@@ -884,6 +1171,35 @@ private:
   ClassTypeCache &cache;
 };
 
+struct VTableLoadMethodOpConversion
+    : public OpConversionPattern<circt::moore::VTableLoadMethodOp> {
+  VTableLoadMethodOpConversion(TypeConverter &tc, MLIRContext *ctx,
+                               ClassTypeCache &cache)
+      : OpConversionPattern(tc, ctx), cache(cache) {}
+
+  LogicalResult
+  matchAndRewrite(circt::moore::VTableLoadMethodOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  ClassTypeCache &cache;
+};
+
+struct ClassMethodBindingOpConversion
+    : public OpConversionPattern<ClassMethodBindingOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ClassMethodBindingOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ClassUpcastOpConversion : public OpConversionPattern<ClassUpcastOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -965,6 +1281,8 @@ struct ClassDeclOpConversion : public OpConversionPattern<ClassDeclOp> {
     if (failed(resolveClassStructBody(op, *typeConverter, cache)))
       return failure();
     // The declaration itself is a no-op
+    auto ref = SymbolRefAttr::get(op);
+    auto global = buildVTableGlobal(rewriter, op->getLoc(), op.getSymName().str() + "::vtable", cache.getStructInfo(ref)->vtableRoot.get());
     rewriter.eraseOp(op);
     return success();
   }
@@ -1748,6 +2066,23 @@ struct BranchOpConversion : public OpConversionPattern<cf::BranchOp> {
   }
 };
 
+struct CallIndirectOpConversion
+    : public OpConversionPattern<func::CallIndirectOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::CallIndirectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> convResTypes;
+    rewriter.eraseOp(op);
+    if (typeConverter->convertTypes(op.getResultTypes(), convResTypes).failed())
+      return failure();
+    // rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+    //     op, adaptor.getCallee(), adaptor.getOperands());
+    return success();
+  }
+};
+
 struct CallOpConversion : public OpConversionPattern<func::CallOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2356,9 +2691,11 @@ static void populateOpConversion(ConversionPatternSet &patterns,
                                      classCache);
   patterns.add<ClassPropertyRefOpConversion>(typeConverter,
                                              patterns.getContext(), classCache);
-
+  patterns.add<VTableLoadMethodOpConversion>(typeConverter,
+                                             patterns.getContext(), classCache);
   // clang-format off
   patterns.add<
+    ClassMethodBindingOpConversion,
     ClassUpcastOpConversion,
     // Patterns of declaration operations.
     VariableOpConversion,
@@ -2463,6 +2800,7 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     HWInstanceOpConversion,
     ReturnOpConversion,
     CallOpConversion,
+    CallIndirectOpConversion,
     UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,

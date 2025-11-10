@@ -20,6 +20,7 @@ add_circt_conversion_library(CIRCTMooreToCore
   MLIRFuncDialect
   MLIRSCFDialect
   MLIRSCFToControlFlow
+  MLIRLLVMCommonConversion
   MLIRSideEffectInterfaces
   MLIRTransforms
 )
