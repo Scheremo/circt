@@ -57,7 +57,28 @@ struct ClassTypeCache {
     // field name -> GEP path inside ident (excluding the leading pointer index)
     DenseMap<StringRef, SmallVector<unsigned, 2>> propertyPath;
 
-    // TODO: Add classVTable in here.
+    /// Record/overwrite the field path to a single property for a class.
+    void setFieldPath(StringRef propertyName, ArrayRef<unsigned> path) {
+      this->propertyPath[propertyName] =
+          SmallVector<unsigned, 2>(path.begin(), path.end());
+    }
+
+    /// Lookup the full GEP path for a (class, field).
+    std::optional<ArrayRef<unsigned>>
+    getFieldPath(StringRef propertySym) const {
+      if (auto prop = this->propertyPath.find(propertySym);
+          prop != this->propertyPath.end())
+        return ArrayRef<unsigned>(prop->second);
+      return std::nullopt;
+    }
+  };
+  struct ClassVTableInfo {
+    LLVM::LLVMStructType classVTable;
+    LLVM::GlobalOp classVTableOp;
+
+    // field name -> GEP path inside ident (excluding the leading pointer index)
+    DenseMap<StringRef, SmallVector<unsigned, 2>> propertyPath;
+
     /// Record/overwrite the field path to a single property for a class.
     void setFieldPath(StringRef propertyName, ArrayRef<unsigned> path) {
       this->propertyPath[propertyName] =
@@ -88,12 +109,137 @@ struct ClassTypeCache {
     return std::nullopt;
   }
 
+  /// Record the identified struct body for a class.
+  /// Implicitly finalizes the class to struct conversion.
+  void setVTableInfo(SymbolRefAttr vTableSym, const ClassVTableInfo &info) {
+    auto &dst = classToVTableMap[vTableSym];
+    dst = info;
+  }
+
+  /// Lookup the identified struct body for a class.
+  std::optional<ClassVTableInfo> getVTableInfo(SymbolRefAttr vTableSym) const {
+    if (auto it = classToVTableMap.find(vTableSym);
+        it != classToVTableMap.end())
+      return it->second;
+    return std::nullopt;
+  }
+
 private:
   // Keyed by the SymbolRefAttr of the class.
   // Kept private so all accesses are done with helpers which preserve
   // invariants
   DenseMap<Attribute, ClassStructInfo> classToStructMap;
+  DenseMap<Attribute, ClassVTableInfo> classToVTableMap;
 };
+
+/// Helper function to create an opaque LLVM Struct Type which corresponds
+/// to the sym
+static LLVM::LLVMStructType getOrCreateOpaqueStruct(MLIRContext *ctx,
+                                                    SymbolRefAttr className) {
+  return LLVM::LLVMStructType::getIdentified(ctx, className.getRootReference());
+}
+
+static LogicalResult resolveClassVTable(circt::moore::VTableOp op,
+                                        ClassTypeCache &cache) {
+
+  SymbolRefAttr classSym =
+      SymbolRefAttr::get(op.getSymNameAttr().getRootReference());
+
+  if (cache.getVTableInfo(classSym))
+    return success();
+
+  SmallVector<Type> vtableMembers;
+  DenseMap<StringRef, SmallVector<unsigned, 2>>
+      localPaths; // entry name -> indices
+  unsigned fieldIndex = 0;
+
+  Block &block = op.getBody().front();
+  for (Operation &child : block) {
+    if (auto sub = dyn_cast<VTableOp>(&child)) {
+      // Recurse: ensure the child table is resolved & cached.
+      if (failed(resolveClassVTable(sub, cache)))
+        return failure();
+
+      // Fetch the child's identified LLVM type from the cache.
+      SymbolRefAttr childRoot =
+          SymbolRefAttr::get(sub.getSymNameAttr().getRootReference());
+      auto childInfo = cache.getVTableInfo(childRoot);
+      assert(childInfo && "subtable must have been cached by recursion");
+
+      // Add the child struct type as a field.
+      vtableMembers.push_back(childInfo->classVTable);
+
+      // Inherit child's entry paths, prefixing with our field index.
+      for (const auto &kv : childInfo->propertyPath) {
+        SmallVector<unsigned, 2> path;
+        path.push_back(fieldIndex); // into child sub-struct
+        path.append(kv.second.begin(), kv.second.end());
+        localPaths[kv.first] = std::move(path);
+      }
+
+      ++fieldIndex;
+    }
+  }
+
+  auto *ctx = op.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  for (Operation &child : block) {
+    if (auto entry = dyn_cast<VTableEntryOp>(&child)) {
+      vtableMembers.push_back(ptrTy);
+
+      // Record the GEP path to this entry relative to THIS table.
+      localPaths[entry.getName()] = SmallVector<unsigned, 2>{fieldIndex};
+      ++fieldIndex;
+    }
+  }
+
+  std::string typeName = (op.getSymNameAttr().getRootReference().str() +
+                          std::string("::vtable_t"));
+  LLVM::LLVMStructType identTy =
+      LLVM::LLVMStructType::getIdentified(ctx, typeName);
+
+  if (!vtableMembers.empty())
+    if (failed(identTy.setBody(vtableMembers, false)))
+      return op.emitOpError() << "Failed to set LLVM Struct body " << typeName;
+
+  ClassTypeCache::ClassVTableInfo info;
+  info.classVTable = identTy;
+  info.propertyPath = std::move(localPaths);
+  std::string globalOpName =
+      (op.getSymNameAttr().getRootReference().str() + std::string("::vtable"));
+  auto builder = mlir::OpBuilder::atBlockBegin(op->getBlock());
+  builder.setInsertionPointAfter(op);
+
+  // Create GlobalOp to represent the vtable
+  auto globalOp = LLVM::GlobalOp::create(builder, op.getLoc(), identTy, true,
+                                         LLVM::Linkage::Internal, globalOpName,
+                                         Attribute());
+
+  info.classVTableOp = globalOp;
+  cache.setVTableInfo(classSym, info);
+
+  return success();
+}
+
+static LogicalResult resolveClassVTable(ModuleOp mod, SymbolRefAttr op,
+                                        ClassTypeCache &cache) {
+
+  if (cache.getVTableInfo(op))
+    return success();
+
+  // Append "::@vtable" to the root reference before lookup.
+  auto ctx = mod.getContext();
+  auto vtableSuffix = mlir::FlatSymbolRefAttr::get(ctx, "vtable");
+  auto fullRef =
+      mlir::SymbolRefAttr::get(op.getRootReference(), {vtableSuffix});
+
+  // Lookup and resolve.
+  if (auto vTableOp = mod.lookupSymbol<VTableOp>(fullRef))
+    return resolveClassVTable(vTableOp, cache);
+
+  return mod.emitError() << "Could not find vtable " << fullRef << " for class "
+                         << op;
+}
 
 /// Ensure we have `declare i8* @malloc(i64)` (opaque ptr prints as !llvm.ptr).
 static LLVM::LLVMFuncOp getOrCreateMalloc(ModuleOp mod, OpBuilder &b) {
@@ -111,13 +257,6 @@ static LLVM::LLVMFuncOp getOrCreateMalloc(ModuleOp mod, OpBuilder &b) {
   // Link this in from somewhere else.
   fn.setLinkage(LLVM::Linkage::External);
   return fn;
-}
-
-/// Helper function to create an opaque LLVM Struct Type which corresponds
-/// to the sym
-static LLVM::LLVMStructType getOrCreateOpaqueStruct(MLIRContext *ctx,
-                                                    SymbolRefAttr className) {
-  return LLVM::LLVMStructType::getIdentified(ctx, className.getRootReference());
 }
 
 static LogicalResult resolveClassStructBody(ClassDeclOp op,
@@ -859,6 +998,122 @@ private:
   ClassTypeCache &cache; // shared, owned by the pass
 };
 
+struct CallIndirectOpConversion : OpConversionPattern<func::CallIndirectOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::CallIndirectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    Value calleePtr = adaptor.getCallee();
+
+    SmallVector<Value> ops;
+    ops.push_back(calleePtr);
+    llvm::append_range(ops, adaptor.getCalleeOperands());
+
+    SmallVector<Type> paramTys;
+    paramTys.reserve(adaptor.getCalleeOperands().size());
+    for (Value v : adaptor.getCalleeOperands())
+      paramTys.push_back(v.getType());
+
+    SmallVector<Type> callResultTys;
+    Type retTy = LLVM::LLVMVoidType::get(ctx);
+    if (op.getNumResults() == 1) {
+      Type one = typeConverter->convertType(
+          op.getResult(0).getType()); // assume already legalized
+      retTy = one;
+      callResultTys.push_back(one);
+    }
+
+    auto fnTy = LLVM::LLVMFunctionType::get(retTy, paramTys, false);
+
+    auto call = LLVM::CallOp::create(rewriter, loc, fnTy, ops);
+    rewriter.replaceOp(op, call.getResults());
+    return success();
+  }
+};
+
+struct VTableLoadMethodOpConversion
+    : public OpConversionPattern<VTableLoadMethodOp> {
+  VTableLoadMethodOpConversion(TypeConverter &tc, MLIRContext *ctx,
+                               ClassTypeCache &cache)
+      : OpConversionPattern<VTableLoadMethodOp>(tc, ctx), cache(cache) {}
+
+  LogicalResult
+  matchAndRewrite(VTableLoadMethodOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    MLIRContext *ctx = rewriter.getContext();
+    Location loc = op.getLoc();
+
+    // Lookup the class handle's vTable
+    auto classHandle = op.getObject();
+    auto classSym = classHandle.getType().getClassSym();
+    ModuleOp mod = op->getParentOfType<ModuleOp>();
+    if (failed(resolveClassVTable(mod, classSym, cache)))
+      return failure();
+
+    auto maybeVTable = cache.getVTableInfo(classSym);
+    assert(maybeVTable.has_value() && "VTable must be resolved");
+    const auto &vTable = maybeVTable.value();
+    auto pathOpt = vTable.getFieldPath(op.getMethodSym().getLeafReference());
+
+    if (!vTable.classVTableOp)
+      return op->emitError() << "Couldn't find materialized VTable!";
+
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    SmallVector<LLVM::GEPArg> idx;
+    idx.emplace_back(0);
+    for (unsigned i : *pathOpt)
+      idx.emplace_back(static_cast<int64_t>(i));
+
+    auto vTablePtr =
+        LLVM::AddressOfOp::create(rewriter, loc, vTable.classVTableOp);
+    auto gep = LLVM::GEPOp::create(rewriter, loc, ptrTy, vTable.classVTable,
+                                   vTablePtr, idx);
+
+    rewriter.replaceOp(op, gep);
+    return success();
+  }
+
+private:
+  ClassTypeCache &cache; // shared, owned by the pass
+};
+
+struct VTableOpConversion : public OpConversionPattern<VTableOp> {
+  VTableOpConversion(TypeConverter &tc, MLIRContext *ctx, ClassTypeCache &cache)
+      : OpConversionPattern<VTableOp>(tc, ctx), cache(cache) {}
+
+  LogicalResult
+  matchAndRewrite(VTableOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    // Resolve vTable struct type, GEP paths for lookups
+    if (failed(resolveClassVTable(op, cache)))
+      return failure();
+    SymbolRefAttr lookupName =
+        SymbolRefAttr::get(op.getSymNameAttr().getRootReference());
+
+    auto maybeVTable = cache.getVTableInfo(lookupName);
+    assert(maybeVTable.has_value() && "vTable must exist after resolution");
+    const auto &vTable = maybeVTable.value();
+
+    // TODO: Convert virtual methods to LLVM, populate global op.
+
+    // Replace vTable declarations with VTable GlobalOp.
+    rewriter.replaceAllOpUsesWith(op, vTable.classVTableOp);
+    // Delete vTable Op.
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  ClassTypeCache &cache; // shared, owned by the pass
+};
+
 struct VariableOpConversion : public OpConversionPattern<VariableOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1449,8 +1704,9 @@ struct CaseXZEqOpConversion : public OpConversionPattern<SourceOp> {
     // Check each operand if it is a known constant and extract the X and/or Z
     // bits to be ignored.
     // TODO: Once the core dialects support four-valued integers, we will have
-    // to create ops that extract X and Z bits from the operands, since we also
-    // have to do the right casez/casex comparison on non-constant inputs.
+    // to create ops that extract X and Z bits from the operands, since we
+    // also have to do the right casez/casex comparison on non-constant
+    // inputs.
     unsigned bitWidth = op.getLhs().getType().getWidth();
     auto ignoredBits = APInt::getZero(bitWidth);
     auto detectIgnoredBits = [&](Value value) {
@@ -1466,8 +1722,8 @@ struct CaseXZEqOpConversion : public OpConversionPattern<SourceOp> {
     detectIgnoredBits(op.getLhs());
     detectIgnoredBits(op.getRhs());
 
-    // If we have detected any bits to be ignored, mask them in the operands for
-    // the comparison.
+    // If we have detected any bits to be ignored, mask them in the operands
+    // for the comparison.
     Value lhs = adaptor.getLhs();
     Value rhs = adaptor.getRhs();
     if (!ignoredBits.isZero()) {
@@ -1809,8 +2065,8 @@ struct ConditionalOpConversion : public OpConversionPattern<ConditionalOp> {
                   ConversionPatternRewriter &rewriter) const override {
     // TODO: This lowering is only correct if the condition is two-valued. If
     // the condition is X or Z, both branches of the conditional must be
-    // evaluated and merged with the appropriate lookup table. See documentation
-    // for `ConditionalOp`.
+    // evaluated and merged with the appropriate lookup table. See
+    // documentation for `ConditionalOp`.
     auto type = typeConverter->convertType(op.getType());
 
     auto hasNoWriteEffect = [](Region &region) {
@@ -2044,6 +2300,7 @@ static void populateLegality(ConversionTarget &target,
   target.addLegalDialect<arith::ArithDialect>();
 
   target.addLegalOp<debug::ScopeOp>();
+  target.addIllegalOp<func::CallIndirectOp>();
 
   target.addDynamicallyLegalOp<scf::YieldOp, func::CallOp, func::ReturnOp,
                                UnrealizedConversionCastOp, hw::OutputOp,
@@ -2141,6 +2398,11 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
     return LLVM::LLVMPointerType::get(type.getContext());
   });
 
+  typeConverter.addConversion([&](FunctionType type) -> Type {
+    (void)type; // we’ll build the real LLVMFunctionType manually in the pattern
+    return LLVM::LLVMPointerType::get(type.getContext()); // opaque ptr
+  });
+
   // Explicitly mark LLVMPointerType as a legal target
   typeConverter.addConversion(
       [](LLVM::LLVMPointerType t) -> std::optional<Type> { return t; });
@@ -2218,6 +2480,10 @@ static void populateOpConversion(ConversionPatternSet &patterns,
   patterns.add<ClassNewOpConversion>(typeConverter, patterns.getContext(),
                                      classCache);
   patterns.add<ClassPropertyRefOpConversion>(typeConverter,
+                                             patterns.getContext(), classCache);
+  patterns.add<VTableOpConversion>(typeConverter, patterns.getContext(),
+                                   classCache);
+  patterns.add<VTableLoadMethodOpConversion>(typeConverter,
                                              patterns.getContext(), classCache);
 
   // clang-format off
@@ -2322,6 +2588,7 @@ static void populateOpConversion(ConversionPatternSet &patterns,
     HWInstanceOpConversion,
     ReturnOpConversion,
     CallOpConversion,
+    CallIndirectOpConversion,
     UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,
