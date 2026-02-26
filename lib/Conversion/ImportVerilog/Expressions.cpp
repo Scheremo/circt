@@ -1650,8 +1650,6 @@ struct RvalueExprVisitor : public ExprVisitor {
     auto args = expr.arguments();
 
     FailureOr<Value> result = Value{};
-    Value value;
-    Value value2;
 
     // $sformatf() and $sformat look like system tasks, but we handle string
     // formatting differently from expression evaluation, so handle them
@@ -1668,9 +1666,40 @@ struct RvalueExprVisitor : public ExprVisitor {
       return fmtValue.value();
     }
 
-    // Queue ops take their parameter as a reference
-    bool isByRefOp = args.size() >= 1 && args[0]->type->isQueue() &&
-                     subroutine.name != "size";
+    // Convert all arguments up front while preserving positional slots.
+    // Slang may represent omitted arguments as `EmptyArgument`.
+    // Queue ops take their first parameter as a reference, except `size`.
+    bool isByRefOp =
+        args.size() >= 1 &&
+        args[0]->kind != slang::ast::ExpressionKind::EmptyArgument &&
+        args[0]->type->isQueue() && subroutine.name != "size";
+    SmallVector<std::optional<Value>> convertedArgs;
+    convertedArgs.reserve(args.size());
+    for (auto [idx, arg] : llvm::enumerate(args)) {
+      if (arg->kind == slang::ast::ExpressionKind::EmptyArgument) {
+        convertedArgs.push_back(std::nullopt);
+        continue;
+      }
+      auto value = (isByRefOp && idx == 0)
+                       ? context.convertLvalueExpression(*arg)
+                       : context.convertRvalueExpression(*arg);
+      if (!value)
+        return {};
+      convertedArgs.push_back(value);
+    }
+
+    // Treat trailing empty arguments as omitted optional arguments.
+    while (!convertedArgs.empty() && !convertedArgs.back())
+      convertedArgs.pop_back();
+
+    // Empty arguments in non-trailing positions are not supported.
+    for (size_t i = 0; i < convertedArgs.size(); ++i) {
+      if (convertedArgs[i])
+        continue;
+      mlir::emitError(loc) << "unsupported empty argument #" << (i + 1)
+                           << " in system call `" << subroutine.name << "`";
+      return {};
+    }
 
     // Call the conversion function with the appropriate arity. These return one
     // of the following:
@@ -1678,26 +1707,19 @@ struct RvalueExprVisitor : public ExprVisitor {
     // - `failure()` if the system call was recognized but some error occurred
     // - `Value{}` if the system call was not recognized
     // - non-null `Value` result otherwise
-    switch (args.size()) {
+    switch (convertedArgs.size()) {
     case (0):
       result = context.convertSystemCallArity0(subroutine, loc);
       break;
 
     case (1):
-      value = isByRefOp ? context.convertLvalueExpression(*args[0])
-                        : context.convertRvalueExpression(*args[0]);
-      if (!value)
-        return {};
-      result = context.convertSystemCallArity1(subroutine, loc, value);
+      result =
+          context.convertSystemCallArity1(subroutine, loc, *convertedArgs[0]);
       break;
 
     case (2):
-      value = isByRefOp ? context.convertLvalueExpression(*args[0])
-                        : context.convertRvalueExpression(*args[0]);
-      value2 = context.convertRvalueExpression(*args[1]);
-      if (!value || !value2)
-        return {};
-      result = context.convertSystemCallArity2(subroutine, loc, value, value2);
+      result = context.convertSystemCallArity2(
+          subroutine, loc, *convertedArgs[0], *convertedArgs[1]);
       break;
 
     default:
